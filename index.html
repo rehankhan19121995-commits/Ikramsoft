@@ -1,0 +1,669 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Steel Ledger Pro</title>
+<meta http-equiv="Cache-Control" content="no-cache, must-revalidate"><meta http-equiv="Pragma" content="no-cache"><link rel="stylesheet" href="style.css?v=2.3"></head>
+<body>
+<div id="gate"></div>
+<div id="app" style="display:none">
+ <aside>
+  <div class="brand"><b>STEEL LEDGER PRO</b><small>Customer Accounts &amp; Billing</small></div>
+  <div id="nav"></div>
+  <div class="foot" id="foot"></div>
+ </aside>
+ <main id="main"></main>
+</div>
+<div id="modalRoot"></div>
+<div id="printRoot"></div>
+<div id="toast"></div>
+
+<script>
+'use strict';
+/* ============ helpers ============ */
+const KEY='steelLedgerPro_v1';
+const MON=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+const $=s=>document.querySelector(s);
+const esc=s=>String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const num=v=>{const n=parseFloat(String(v==null?'':v).replace(/,/g,''));return isNaN(n)?0:n};
+const money=n=>Math.round(n).toLocaleString('en-US');
+const qtyf=n=>(+n).toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:3});
+const short=n=>n>=1e7?(n/1e7).toFixed(2)+' Cr':n>=1e5?(n/1e5).toFixed(1)+' L':money(n);
+const today=()=>new Date(Date.now()-new Date().getTimezoneOffset()*60000).toISOString().slice(0,10);
+const fd8=iso=>{if(!iso)return '';const p=iso.split('-');return p.length<3?iso:p[2]+'-'+MON[+p[1]-1]+'-'+p[0]};
+const bi=(en,ur)=>'<span>'+en+'</span> <span class="ur">'+ur+'</span>';
+const sum=(a,f)=>a.reduce((s,x)=>s+f(x),0);
+const csvq=v=>'"'+String(v==null?'':v).replace(/"/g,'""')+'"';
+let memoryOnly=false;
+
+/* ============ data ============ */
+function seed(){
+ return {v:1,meta:{seq:1,nextCust:1,nextEnt:1,nextInv:1,lastBackup:null},
+  settings:{name:'Your Business Name',nameUr:'',address:'',phone:'',bank:'',invPrefix:'INV-'},
+  customers:[],grades:[],rates:[],entries:[]};
+}
+function migrate(d){d.purchases=d.purchases||[];d.quotes=d.quotes||[];d.log=d.log||[];d.gradeMin=d.gradeMin||{};d.meta=d.meta||{};['nextPur','nextQuote'].forEach(k=>{d.meta[k]=d.meta[k]||1});d.customers.forEach(c=>{if(c.limit==null)c.limit=0;if(c.days==null)c.days=30});return d}
+function load(){
+ try{const s=localStorage.getItem(KEY);if(s){const d=JSON.parse(s);if(d&&Array.isArray(d.customers)&&Array.isArray(d.entries))return migrate(d);}}
+ catch(e){memoryOnly=true}
+ return migrate(seed());
+}
+let DB=load();
+function save(){try{localStorage.setItem(KEY,JSON.stringify(DB))}catch(e){memoryOnly=true}}
+save();
+
+const cust=id=>DB.customers.find(c=>c.id===id);
+const entriesOf=id=>DB.entries.filter(e=>e.cid===id).sort((a,b)=>a.seq-b.seq);
+function ledger(cid){
+ const c=cust(cid);let bal=num(c&&c.opening);
+ return entriesOf(cid).map(e=>{bal+=e.type==='supply'?e.amount:-e.amount;return Object.assign({},e,{bal})});
+}
+function balanceOf(cid){const l=ledger(cid);return l.length?l[l.length-1].bal:num(cust(cid).opening)}
+const balHtml=b=>b>0?'<span class="cr">'+money(b)+' CR</span>':b<0?'<span class="dr">'+money(-b)+' DR</span>':'<span>0</span>';
+const invNo=n=>DB.settings.invPrefix+String(n).padStart(4,'0');
+function rateFor(grade,date){
+ const h=DB.rates.filter(r=>r.grade.toLowerCase()===String(grade).trim().toLowerCase()&&r.from<=date).sort((a,b)=>b.from.localeCompare(a.from));
+ return h.length?h[0].rate:null;
+}
+function nextSerial(cid){
+ const s=DB.entries.filter(e=>e.cid===cid&&e.type==='supply').map(e=>+e.serial||0);
+ return Math.max(0,...s)+1;
+}
+
+/* ============ alerts (missing numbers etc.) ============ */
+function alerts(){
+ const a=[];
+ DB.customers.forEach(c=>{
+  const sup=DB.entries.filter(e=>e.cid===c.id&&e.type==='supply');
+  const ser=sup.map(e=>+e.serial).filter(Boolean);
+  const mx=Math.max(0,...ser);
+  for(let i=1;i<=mx;i++){if(!ser.includes(i))a.push({bad:1,cid:c.id,msg:'<b>'+esc(c.name)+'</b>: serial no. '+i+' is MISSING'})}
+  const seen={};ser.forEach(s=>{seen[s]=(seen[s]||0)+1});
+  Object.keys(seen).forEach(s=>{if(seen[s]>1)a.push({bad:1,cid:c.id,msg:'<b>'+esc(c.name)+'</b>: serial no. '+s+' is used '+seen[s]+' times'})});
+ });
+ const inv=DB.entries.filter(e=>e.type==='supply').map(e=>+e.invoice).filter(Boolean);
+ const im=Math.max(0,...inv);
+ for(let i=1;i<=im;i++){if(!inv.includes(i))a.push({bad:1,msg:'Invoice no. <b>'+invNo(i)+'</b> is MISSING (an entry was deleted)'})}
+ DB.entries.filter(e=>e.type==='payment'&&e.mode==='Cheque'&&!e.ref).forEach(e=>{const c=cust(e.cid);a.push({cid:e.cid,msg:'<b>'+esc(c?c.name:'?')+'</b>: cheque of '+money(e.amount)+' ('+fd8(e.date)+') has no reference no.'})});
+ DB.entries.filter(e=>e.type==='supply'&&!(e.rate>0)).forEach(e=>{const c=cust(e.cid);a.push({cid:e.cid,msg:'<b>'+esc(c?c.name:'?')+'</b>: serial '+e.serial+' has no rate'})});
+ DB.customers.forEach(c=>{const b=balanceOf(c.id);if(num(c.limit)>0&&b>num(c.limit))a.push({bad:1,cid:c.id,msg:'<b>'+esc(c.name)+'</b>: CREDIT LIMIT exceeded — balance '+money(b)+' vs limit '+money(c.limit)});const ov=ageing(c.id).overdue;if(ov>0)a.push({cid:c.id,msg:'<b>'+esc(c.name)+'</b>: '+money(ov)+' is overdue (older than '+(num(c.days)||30)+' days)'})});
+ DB.grades.forEach(g=>{const s=stockInfo(g),mn=num(DB.gradeMin[g]);if(s.tracked&&s.stock<0)a.push({bad:1,msg:'Stock of <b>'+esc(g)+'</b> is negative ('+qtyf(s.stock)+' MT) — more delivered than purchased'});else if(s.tracked&&mn>0&&s.stock<=mn)a.push({msg:'Low stock: <b>'+esc(g)+'</b> has '+qtyf(s.stock)+' MT left (alert level '+qtyf(mn)+')'})});
+ return a;
+}
+
+/* ============ UI shell ============ */
+let view={name:'dashboard',cid:null};
+const NAVA=['admin','Admin Panel','ایڈمن'];
+const NAV=[['dashboard','Dashboard','ڈیش بورڈ'],['customers','Customers','گاہک'],['rates','Steel Rates','ریٹ'],['quotes','Quotations','کوٹیشن'],['stock','Stock & Heat No.','اسٹاک'],['billing','Billing','بلنگ'],['settings','Settings & Backup','سیٹنگز']];
+function nav(name,cid){view={name:name,cid:cid||null};render();window.scrollTo(0,0)}
+function render(){
+ {const b=view.name==='customer'?'customers':view.name;if(b==='admin'?!isAdmin():!can(b)){const a=NAV.find(n=>can(n[0]));view={name:a?a[0]:'none',cid:null}}}
+ $('#nav').innerHTML=NAV.filter(n=>can(n[0])).concat(isAdmin()?[NAVA]:[]).map(n=>'<a class="'+((view.name===n[0]||(view.name==='customer'&&n[0]==='customers'))?'on':'')+'" onclick="nav(\''+n[0]+'\')"><span>'+n[1]+'</span><span class="ur">'+n[2]+'</span></a>').join('');
+ $('#foot').innerHTML=(memoryOnly?'Data NOT being saved!':'Saved in this browser')+(ME?'<div class="who"><span>'+esc(ME.name)+'</span><button class="btn sm ghost" onclick="logout()">Lock</button></div>':'');
+ const f={dashboard:viewDashboard,customers:viewCustomers,customer:viewCustomer,rates:viewRates,quotes:viewQuotes,stock:viewStock,billing:viewBilling,settings:viewSettings,admin:viewAdmin}[view.name]||(()=>'<div class="card">Your account has no sections yet. Ask the admin to give you access.</div>');
+ let banner='';
+ if(memoryOnly)banner='<div class="banner">This browser is blocking storage, so your data will be lost when you close the page. Use Settings → Backup often, or open the file in Chrome / Edge.</div>';
+ else{const lb=DB.meta.lastBackup,days=lb?(Date.now()-new Date(lb))/864e5:999;
+  if(days>7)banner='<div class="banner y">Backup reminder: '+(lb?'last backup was '+Math.floor(days)+' days ago.':'you have never made a backup.')+' <a href="#" onclick="nav(\'settings\');return false">Make a backup now</a> (your data lives only in this browser).</div>'}
+ $('#main').innerHTML=banner+f();
+}
+function head(en,ur,sub){return '<h1>'+en+' <span class="ur">'+ur+'</span></h1><div class="sub">'+(sub||'')+'</div>'}
+function toast(m){const t=$('#toast');t.textContent=m;t.style.display='block';clearTimeout(toast.t);toast.t=setTimeout(()=>t.style.display='none',2600)}
+
+/* ============ Dashboard ============ */
+function viewDashboard(){
+ const ym=today().slice(0,7);
+ const sup=DB.entries.filter(e=>e.type==='supply'),pay=DB.entries.filter(e=>e.type==='payment');
+ const bals=DB.customers.map(c=>({c:c,b:balanceOf(c.id)}));
+ const due=sum(bals.filter(x=>x.b>0),x=>x.b), adv=sum(bals.filter(x=>x.b<0),x=>-x.b);
+ const ms=sup.filter(e=>(e.date||'').startsWith(ym)),mp=pay.filter(e=>(e.date||'').startsWith(ym));
+ const top=bals.filter(x=>x.b>0).sort((a,b)=>b.b-a.b).slice(0,6),mx=top.length?top[0].b:1;
+ const al=alerts(),ag=ageingAll(),pf=profit(ym);
+ const grades={};sup.forEach(e=>{const g=e.grade||'?';grades[g]=grades[g]||{all:0,m:0,amt:0};grades[g].all+=e.qty;grades[g].amt+=e.amount;if((e.date||'').startsWith(ym))grades[g].m+=e.qty});
+ const recent=DB.entries.slice().sort((a,b)=>b.seq-a.seq).slice(0,8);
+ return head('Dashboard','ڈیش بورڈ','Overview of all customers — '+fd8(today()))+
+ '<div class="grid kpis">'+
+ kpi('Customers',DB.customers.length,'registered accounts','')+
+ kpi('Total Outstanding',money(due)+' CR','customers owe you','red')+
+ kpi('Overdue',money(ag.overdue)+' CR','older than credit days','red')+
+ kpi('Supplied This Month',money(sum(ms,e=>e.amount))+' CR',qtyf(sum(ms,e=>e.qty))+' MT','red')+
+ kpi('Received This Month',money(sum(mp,e=>e.amount))+' DR',mp.length+' payment(s)','green')+
+ kpi('Total Steel Sold',qtyf(sum(sup,e=>e.qty))+' MT',sup.length+' deliveries','gold')+
+ (pf.known?kpi('Est. Profit This Month',money(pf.p),'sale − avg purchase cost',pf.p>=0?'green':'red'):'')+
+ (adv>0?kpi('Advance Held',money(adv)+' DR','paid in advance','green'):'')+
+ '</div>'+
+ '<div class="grid two">'+
+ '<div class="card"><h2>'+bi('Supplied vs Received — last 6 months','مال اور وصولی')+'</h2>'+chart()+'</div>'+
+ '<div class="card"><h2>'+bi('Top Outstanding Customers','سب سے زیادہ بقایا')+'</h2>'+
+  (top.length?top.map(x=>'<div class="hb"><div class="nm"><a href="#" onclick="nav(\'customer\',\''+x.c.id+'\');return false">'+esc(x.c.name)+'</a></div><div class="tr"><div class="fl" style="width:'+Math.max(2,x.b/mx*100)+'%"></div></div><div class="vv cr">'+short(x.b)+'</div></div>').join(''):'<div class="ok">No outstanding balances.</div>')+'</div>'+
+ '</div>'+
+ '<div class="grid two">'+
+ '<div class="card"><h2>'+bi('Alerts','انتباہ')+'</h2>'+(al.length?al.slice(0,12).map(a=>'<div class="alert '+(a.bad?'bad':'')+'">'+a.msg+(a.cid?' <a href="#" onclick="nav(\'customer\',\''+a.cid+'\');return false">open</a>':'')+'</div>').join('')+(al.length>12?'<div class="sub">+ '+(al.length-12)+' more</div>':''):'<div class="ok">✔ No missing serial / invoice numbers. Everything looks fine.</div>')+'</div>'+
+ '<div class="card"><h2>'+bi('Steel by Grade','گریڈ کے مطابق')+'</h2><div class="tw"><table><thead><tr><th>Grade</th><th>This Month (MT)</th><th>All Time (MT)</th><th>Amount</th></tr></thead><tbody>'+
+  (Object.keys(grades).length?Object.keys(grades).map(g=>'<tr><td>'+esc(g)+'</td><td class="n">'+qtyf(grades[g].m)+'</td><td class="n">'+qtyf(grades[g].all)+'</td><td class="n">'+money(grades[g].amt)+'</td></tr>').join(''):'<tr><td colspan="4" class="c">No deliveries yet</td></tr>')+'</tbody></table></div></div>'+
+ '</div>'+
+ '<div class="card"><h2>'+bi('Receivables Ageing','بقایا جات کی عمر')+' <button class="btn sm ghost" onclick="printAgeing()">Print</button></h2><div class="tw"><table><thead><tr><th>0–30 days</th><th>31–60 days</th><th>61–90 days</th><th>Over 90 days</th><th>Opening balances</th><th>Total outstanding</th></tr></thead><tbody><tr>'+[ag.b0,ag.b1,ag.b2,ag.b3,ag.open].map(v=>'<td class="n">'+(v?money(v):'-')+'</td>').join('')+'<td class="n"><b>'+money(ag.total)+'</b></td></tr></tbody></table></div><div class="hint">Payments are applied to the oldest invoices first. Opening balances count as overdue.</div></div>'+
+ '<div class="card"><h2>'+bi('Recent Activity','حالیہ اندراجات')+'</h2><div class="tw"><table><thead><tr><th>Date</th><th>Customer</th><th>Details</th><th>Credit (CR)</th><th>Debit (DR)</th></tr></thead><tbody>'+
+ (recent.length?recent.map(e=>{const c=cust(e.cid);return '<tr class="link" onclick="nav(\'customer\',\''+e.cid+'\')"><td>'+fd8(e.date)+'</td><td>'+esc(c?c.name:'?')+'</td><td>'+(e.type==='supply'?esc(e.grade)+' · '+qtyf(e.qty)+' MT @ '+money(e.rate):esc(e.mode)+(e.bank?' · '+esc(e.bank):''))+'</td>'+(e.type==='supply'?'<td class="crc">'+money(e.amount)+' CR</td><td></td>':'<td></td><td class="drc">'+money(e.amount)+' DR</td>')+'</tr>'}).join(''):'<tr><td colspan="5" class="c">No entries yet</td></tr>')+'</tbody></table></div></div>';
+}
+function kpi(l,v,s,c){return '<div class="kpi '+c+'"><div class="l">'+l+'</div><div class="v '+(c==='red'?'cr':c==='green'?'dr':'')+'" style="'+(c?'':'')+'">'+v+'</div><div class="s">'+s+'</div></div>'}
+function chart(){
+ const now=new Date(),ms=[];
+ for(let i=5;i>=0;i--){const d=new Date(now.getFullYear(),now.getMonth()-i,1);ms.push([d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0'),MON[d.getMonth()]])}
+ const S=ms.map(m=>sum(DB.entries.filter(e=>e.type==='supply'&&(e.date||'').startsWith(m[0])),e=>e.amount));
+ const P=ms.map(m=>sum(DB.entries.filter(e=>e.type==='payment'&&(e.date||'').startsWith(m[0])),e=>e.amount));
+ const mx=Math.max(1,...S,...P),H=170,base=200;
+ let s='<svg viewBox="0 0 620 235" style="width:100%;height:auto" font-family="Arial">';
+ for(let g=0;g<=4;g++){const y=base-g*H/4;s+='<line x1="45" x2="610" y1="'+y+'" y2="'+y+'" stroke="#E2E8F2"/><text x="40" y="'+(y+4)+'" font-size="10" fill="#5d6b82" text-anchor="end">'+short(mx*g/4)+'</text>'}
+ ms.forEach((m,i)=>{
+  const x=60+i*92,hs=S[i]/mx*H,hp=P[i]/mx*H;
+  s+='<rect x="'+x+'" y="'+(base-hs)+'" width="30" height="'+hs+'" fill="#C00000" rx="3"><title>Supplied '+money(S[i])+'</title></rect>';
+  s+='<rect x="'+(x+34)+'" y="'+(base-hp)+'" width="30" height="'+hp+'" fill="#1E7B34" rx="3"><title>Received '+money(P[i])+'</title></rect>';
+  s+='<text x="'+(x+32)+'" y="'+(base+16)+'" font-size="11" fill="#1b2433" text-anchor="middle">'+m[1]+'</text>';
+  if(S[i])s+='<text x="'+(x+15)+'" y="'+(base-hs-4)+'" font-size="9" fill="#C00000" text-anchor="middle">'+short(S[i])+'</text>';
+  if(P[i])s+='<text x="'+(x+49)+'" y="'+(base-hp-4)+'" font-size="9" fill="#1E7B34" text-anchor="middle">'+short(P[i])+'</text>';
+ });
+ s+='<rect x="60" y="222" width="10" height="10" fill="#C00000"/><text x="75" y="231" font-size="11">Steel supplied (CR)</text><rect x="200" y="222" width="10" height="10" fill="#1E7B34"/><text x="215" y="231" font-size="11">Payment received (DR)</text></svg>';
+ return s;
+}
+
+/* ============ Customers ============ */
+function viewCustomers(){
+ const rows=DB.customers.map(c=>{const l=ledger(c.id),b=l.length?l[l.length-1].bal:num(c.opening);
+  return {c:c,b:b,cr:sum(l.filter(e=>e.type==='supply'),e=>e.amount),dr:sum(l.filter(e=>e.type==='payment'),e=>e.amount),mt:sum(l.filter(e=>e.type==='supply'),e=>e.qty),last:l.length?l[l.length-1].date:'',ov:ageing(c.id).overdue}}).sort((a,b)=>b.b-a.b);
+ return head('Customers','گاہک','Click a customer to open their separate account sheet')+
+ '<div class="bar"><input id="cs" placeholder="Search customer…" oninput="filt(\'cs\',\'#ctab tbody tr\')"><span class="sp"></span><button class="btn" onclick="modalCustomer()">+ Add Customer</button></div>'+
+ '<div class="card tw"><table id="ctab"><thead><tr><th>#</th><th>Customer</th><th>City</th><th>Phone</th><th>Steel Sold (MT)</th><th>Total Credit (CR)</th><th>Total Received (DR)</th><th>Balance</th><th>Credit Limit</th><th>Overdue</th><th>Last Entry</th></tr></thead><tbody>'+
+ (rows.length?rows.map((r,i)=>'<tr class="link" data-s="'+esc((r.c.name+' '+r.c.city+' '+r.c.phone).toLowerCase())+'" onclick="nav(\'customer\',\''+r.c.id+'\')"><td class="c">'+(i+1)+'</td><td><b>'+esc(r.c.name)+'</b></td><td>'+esc(r.c.city)+'</td><td>'+esc(r.c.phone)+'</td><td class="n">'+qtyf(r.mt)+'</td><td class="n cr">'+money(r.cr)+'</td><td class="n dr">'+money(r.dr)+'</td><td class="n">'+balHtml(r.b)+'</td><td class="n">'+(num(r.c.limit)>0?(r.b>num(r.c.limit)?'<span class="cr">'+money(r.c.limit)+' ⚠</span>':money(r.c.limit)):'—')+'</td><td class="n">'+(r.ov>0?'<span class="cr">'+money(r.ov)+'</span>':'—')+'</td><td class="c">'+fd8(r.last)+'</td></tr>').join(''):'<tr><td colspan="11" class="c">No customers yet. Click “Add Customer”.</td></tr>')+
+ '</tbody><tfoot><tr><td colspan="5">TOTAL ('+rows.length+' customers)</td><td class="n">'+money(sum(rows,r=>r.cr))+'</td><td class="n">'+money(sum(rows,r=>r.dr))+'</td><td class="n">'+money(sum(rows,r=>r.b))+'</td><td></td><td class="n">'+money(sum(rows,r=>r.ov))+'</td><td></td></tr></tfoot></table></div>';
+}
+function filt(inputId,sel){const q=$('#'+inputId).value.toLowerCase();document.querySelectorAll(sel).forEach(r=>{r.style.display=(r.dataset.s||'').includes(q)?'':'none'})}
+
+function viewCustomer(){
+ const c=cust(view.cid);if(!c){view={name:'customers'};return viewCustomers()}
+ const l=ledger(c.id),b=l.length?l[l.length-1].bal:num(c.opening);
+ const cr=sum(l.filter(e=>e.type==='supply'),e=>e.amount),dr=sum(l.filter(e=>e.type==='payment'),e=>e.amount);
+ const al=alerts().filter(a=>a.cid===c.id);
+ return '<div class="bar"><a href="#" onclick="nav(\'customers\');return false">← All Customers</a></div>'+
+ '<h1>'+esc(c.name)+'</h1><div class="sub">'+esc([c.city,c.phone].filter(Boolean).join(' · '))+(c.notes?' — '+esc(c.notes):'')+' · Credit limit: <b>'+(num(c.limit)>0?money(c.limit):'none')+'</b> · Credit days: <b>'+(num(c.days)||30)+'</b></div>'+
+ '<div class="grid kpis">'+kpi('Opening Balance',balHtml(num(c.opening)),'','')+kpi('Steel Supplied (CR)',money(cr)+' CR',qtyf(sum(l.filter(e=>e.type==='supply'),e=>e.qty))+' MT','red')+kpi('Received (DR)',money(dr)+' DR',l.filter(e=>e.type==='payment').length+' payment(s)','green')+kpi('Balance Due',b>0?money(b)+' CR':b<0?money(-b)+' DR':'0',b>0?'customer owes you':b<0?'paid in advance':'settled',b>0?'red':b<0?'green':'')+'</div>'+
+ al.map(a=>'<div class="alert '+(a.bad?'bad':'')+'">'+a.msg+'</div>').join('')+
+ '<div class="bar"><button class="btn red" onclick="modalSupply(\''+c.id+'\')">+ Steel Supplied (CR)</button><button class="btn green" onclick="modalPayment(\''+c.id+'\')">+ Payment Received (DR)</button><span class="sp"></span><button class="btn ghost" onclick="printStatement(\''+c.id+'\',\'\',\'\')">Statement</button><button class="btn ghost" onclick="exportCustomerCsv(\''+c.id+'\')">Export Excel/CSV</button><button class="btn ghost" onclick="modalCustomer(\''+c.id+'\')">Edit</button><button class="btn danger" onclick="delCustomer(\''+c.id+'\')">Delete</button></div>'+
+ '<div class="card tw" style="padding:0"><table><thead><tr><th>Serial<span class="ur">نمبر</span></th><th>Date<span class="ur">تاریخ</span></th><th>Item Description<span class="ur">تفصیل</span></th><th>Net Qty (MT)<span class="ur">وزن</span></th><th>Size<span class="ur">سائز</span></th><th>Rate (PKR/MT)<span class="ur">ریٹ</span></th><th>Amount (PKR)<span class="ur">رقم</span></th><th>Bank Detail<span class="ur">بینک</span></th><th>Slip Date<span class="ur">سلپ</span></th><th>Cheque / Cash<span class="ur">چیک / نقد</span></th><th>Reference No<span class="ur">حوالہ</span></th><th>Credit (CR)<span class="ur">ادھار</span></th><th>Debit (DR)<span class="ur">وصولی</span></th><th>Time Period<span class="ur">مدت</span></th><th>Balance<span class="ur">بقایا</span></th><th></th></tr></thead><tbody>'+
+ (l.length?l.map(e=>{const s=e.type==='supply';return '<tr><td class="c">'+(s?esc(e.serial):'')+'</td><td class="c">'+fd8(e.date)+'</td><td>'+(s?esc(e.grade)+(e.heat?' <small style="color:#5d6b82">· '+esc(e.heat)+'</small>':''):'<i style="color:#5d6b82">Payment</i>')+'</td><td class="n">'+(s?qtyf(e.qty):'')+'</td><td class="c">'+(s?esc(e.size):'')+'</td><td class="n">'+(s?money(e.rate):'')+'</td><td class="n">'+(s?money(e.amount):'')+'</td><td>'+esc(s?'':e.bank)+'</td><td class="c">'+(s?'':fd8(e.slip))+'</td><td class="c">'+(s?'':'<span class="pill '+(e.mode==='Cash'?'cash':'chq')+'">'+esc(e.mode)+'</span>')+'</td><td class="c">'+(s?'':esc(e.ref))+'</td>'+(s?'<td class="crc">'+money(e.amount)+' CR</td><td></td>':'<td></td><td class="drc">'+money(e.amount)+' DR</td>')+'<td class="c">'+(s?esc(e.time):'')+'</td><td class="n">'+balHtml(e.bal)+'</td><td>'+(s?'<button class="btn sm ghost" onclick="printInvoice(\''+e.id+'\')">Invoice</button> <button class="btn sm ghost" onclick="printChallan(\''+e.id+'\')">Challan</button> ':'')+'<button class="btn sm ghost" onclick="'+(s?'modalSupply':'modalPayment')+'(\''+c.id+'\',\''+e.id+'\')">Edit</button> <button class="btn sm danger" onclick="delEntry(\''+e.id+'\')">✕</button></td></tr>'}).join(''):'<tr><td colspan="16" class="c" style="padding:22px">No entries yet for this customer.</td></tr>')+
+ '</tbody><tfoot><tr><td colspan="3">TOTAL</td><td class="n">'+qtyf(sum(l.filter(e=>e.type==='supply'),e=>e.qty))+'</td><td colspan="2"></td><td class="n">'+money(cr)+'</td><td colspan="4"></td><td class="n">'+money(cr)+' CR</td><td class="n">'+money(dr)+' DR</td><td></td><td class="n">'+(b>0?money(b)+' CR':b<0?money(-b)+' DR':'0')+'</td><td></td></tr></tfoot></table></div>';
+}
+
+/* ============ modals ============ */
+function openModal(title,body,onSave,label){
+ $('#modalRoot').innerHTML='<div class="ov" onmousedown="if(event.target===this)closeModal()"><div class="md"><h3>'+title+'</h3><form id="mf">'+body+'<div class="mfoot"><button type="button" class="btn ghost" onclick="closeModal()">Cancel</button><button class="btn" type="submit">'+(label||'Save')+'</button></div></form></div></div>';
+ const f=$('#mf');
+ f.onsubmit=ev=>{ev.preventDefault();const d=Object.fromEntries(new FormData(f).entries());if(onSave(d,f)!==false)closeModal()};
+ const first=f.querySelector('input:not([type=hidden]),select');if(first)first.focus();
+ return f;
+}
+function closeModal(){$('#modalRoot').innerHTML=''}
+document.addEventListener('keydown',e=>{if(e.key==='Escape'){closeModal();closePrint()}});
+
+function modalCustomer(id){
+ const c=id?cust(id):{name:'',city:'',phone:'',opening:0,notes:'',limit:0,days:30};
+ openModal(id?'Edit Customer':'Add Customer',
+ '<label>Customer / Party name *<input name="name" required value="'+esc(c.name)+'"></label>'+
+ '<div class="f2"><label>City<input name="city" value="'+esc(c.city)+'"></label><label>Phone<input name="phone" value="'+esc(c.phone)+'"></label></div>'+
+ '<label>Opening balance (PKR)<input name="opening" type="number" step="any" value="'+esc(c.opening||0)+'"><div class="hint">Positive = customer already owes you (CR). Negative = he paid in advance (DR). Use 0 for a new customer.</div></label>'+
+ '<div class="f2"><label>Credit limit (PKR)<input name="limit" type="number" step="any" min="0" value="'+esc(c.limit||0)+'"><div class="hint">0 = no limit. You are warned when a delivery goes over it.</div></label><label>Credit days<input name="days" type="number" min="1" value="'+esc(c.days||30)+'"><div class="hint">Used for the overdue / ageing report.</div></label></div>'+
+ '<label>Notes<input name="notes" value="'+esc(c.notes||'')+'"></label>',
+ d=>{
+  if(!d.name.trim())return false;
+  if(DB.customers.some(x=>x.id!==id&&x.name.trim().toLowerCase()===d.name.trim().toLowerCase())&&!confirm('A customer with this name already exists. Add anyway?'))return false;
+  const o={name:d.name.trim(),city:d.city.trim(),phone:d.phone.trim(),opening:num(d.opening),notes:d.notes.trim(),limit:num(d.limit),days:Math.round(num(d.days))||30};
+  if(id)Object.assign(cust(id),o);else{const nid='c'+DB.meta.nextCust++;DB.customers.push(Object.assign({id:nid},o));view={name:'customer',cid:nid}}
+  log((id?'Edited':'Added')+' customer '+o.name);save();render();toast('Customer saved');
+ });
+}
+function delCustomer(id){
+ const n=DB.entries.filter(e=>e.cid===id).length;
+ if(!confirm('Delete "'+cust(id).name+'" and all '+n+' of their entries? This cannot be undone (make a backup first).'))return;
+ log('Deleted customer '+cust(id).name+' ('+n+' entries)');DB.entries=DB.entries.filter(e=>e.cid!==id);DB.customers=DB.customers.filter(c=>c.id!==id);save();nav('customers');toast('Customer deleted');
+}
+function custOptions(sel){return DB.customers.slice().sort((a,b)=>a.name.localeCompare(b.name)).map(c=>'<option value="'+c.id+'"'+(c.id===sel?' selected':'')+'>'+esc(c.name)+'</option>').join('')}
+
+function modalSupply(cid,eid){
+ if(!DB.customers.length){toast('Add a customer first');return}
+ const e=eid?DB.entries.find(x=>x.id===eid):null;
+ const v=e||{cid:cid||DB.customers[0].id,date:today(),serial:'',grade:'',size:'',qty:'',rate:'',time:'',note:''};
+ const f=openModal((e?'Edit':'New')+' Steel Supply (Credit)',
+ '<label>Customer *<select name="cid">'+custOptions(v.cid)+'</select></label>'+
+ '<div class="f2"><label>Date * (click for calendar)<input type="date" name="date" required value="'+v.date+'"></label><label>Serial no.<input type="number" name="serial" min="1" value="'+esc(v.serial)+'"></label></div>'+
+ '<div class="f2"><label>Item / Steel grade *<input name="grade" list="gl" required autocomplete="off" value="'+esc(v.grade)+'"><datalist id="gl">'+DB.grades.map(g=>'<option value="'+esc(g)+'">').join('')+'</datalist></label><label>Size<input name="size" value="'+esc(v.size)+'"></label></div>'+
+ '<div class="f2"><label>Net Qty (MT) *<input type="number" step="any" min="0" name="qty" required value="'+esc(v.qty)+'"></label><label>Rate (PKR / MT) *<input type="number" step="any" min="0" name="rate" required value="'+esc(v.rate)+'"><div class="hint" id="rh"></div></label></div>'+
+ '<label>Amount (PKR) = Qty × Rate<div class="amt cr" id="am">0 CR</div></label>'+
+ '<div class="f2"><label>Heat / Lot no.<input name="heat" value="'+esc(v.heat)+'" placeholder="for traceability"></label><label>Vehicle no.<input name="vehicle" value="'+esc(v.vehicle)+'"></label></div>'+
+ '<label>Time period (payment term)<input name="time" placeholder="e.g. 20-25 Days" value="'+esc(v.time)+'"></label>'+
+ '<label>Note<input name="note" value="'+esc(v.note||'')+'"></label>',
+ d=>{
+  const qty=num(d.qty),rate=num(d.rate);
+  if(!d.grade.trim()||qty<=0||rate<=0){toast('Enter grade, quantity and rate');return false}
+  let serial=Math.round(num(d.serial))||nextSerial(d.cid);
+  if(DB.entries.some(x=>x.cid===d.cid&&x.type==='supply'&&+x.serial===serial&&(!e||x.id!==e.id))&&!confirm('Serial no. '+serial+' already exists for this customer. Save anyway?'))return false;
+  const o={cid:d.cid,type:'supply',date:d.date,serial:serial,grade:d.grade.trim(),size:d.size.trim(),qty:qty,rate:rate,amount:Math.round(qty*rate),time:d.time.trim(),note:d.note.trim(),heat:d.heat.trim(),vehicle:d.vehicle.trim()};
+  const c0=cust(o.cid),cur=balanceOf(o.cid)-(e&&e.cid===o.cid?e.amount:0);
+  if(num(c0.limit)>0&&cur+o.amount>num(c0.limit)&&!confirm('CREDIT LIMIT EXCEEDED\n\n'+c0.name+': balance after this delivery would be '+money(cur+o.amount)+' CR, limit is '+money(c0.limit)+'.\n\nSave anyway?'))return false;
+  const st=stockInfo(o.grade);
+  if(st.tracked){const avail=st.stock+(e&&String(e.grade).toLowerCase()===o.grade.toLowerCase()?e.qty:0);if(o.qty>avail&&!confirm('LOW STOCK\n\nOnly '+qtyf(avail)+' MT of '+o.grade+' in stock, but this delivery is '+qtyf(o.qty)+' MT.\n\nSave anyway?'))return false}
+  const g=o.grade;
+  if(!DB.grades.some(x=>x.toLowerCase()===g.toLowerCase()))DB.grades.push(g);
+  if(!DB.rates.some(r=>r.grade.toLowerCase()===g.toLowerCase()))DB.rates.push({grade:g,from:d.date,rate:rate});
+  if(e)Object.assign(e,o);else DB.entries.push(Object.assign({id:'e'+DB.meta.nextEnt++,seq:DB.meta.seq++,invoice:DB.meta.nextInv++},o));
+  log((e?'Edited':'New')+' supply: '+c0.name+' · '+o.grade+' '+qtyf(o.qty)+' MT · '+money(o.amount)+' CR'+(e?'':' · '+invNo(DB.meta.nextInv-1)));save();render();toast('Saved'+(e?'':' — invoice '+invNo(DB.meta.nextInv-1)));
+ });
+ let manual=!!e;
+ const q=n=>f.elements[n];
+ const upd=()=>{
+  q('qty').value&&0;
+  $('#am').textContent=money(Math.round(num(q('qty').value)*num(q('rate').value)))+' CR';
+  const r=rateFor(q('grade').value,q('date').value);
+  $('#rh').textContent=r!=null?'Rate list: '+money(r)+' (valid on this date)':(q('grade').value?'Not in rate list — type the rate':'');
+ };
+ const auto=()=>{if(manual)return;const r=rateFor(q('grade').value,q('date').value);if(r!=null)q('rate').value=r;upd()};
+ if(!e){q('serial').value=nextSerial(q('cid').value);q('cid').onchange=()=>{q('serial').value=nextSerial(q('cid').value)}}
+ q('grade').oninput=auto;q('grade').onchange=auto;q('date').onchange=auto;
+ q('rate').oninput=()=>{manual=true;upd()};q('qty').oninput=upd;
+ upd();
+}
+
+function modalPayment(cid,eid){
+ if(!DB.customers.length){toast('Add a customer first');return}
+ const e=eid?DB.entries.find(x=>x.id===eid):null;
+ const v=e||{cid:cid||DB.customers[0].id,date:today(),amount:'',mode:'Cash',bank:'',slip:'',ref:'',note:''};
+ const f=openModal((e?'Edit':'New')+' Payment Received (Debit)',
+ '<label>Customer *<select name="cid">'+custOptions(v.cid)+'</select></label>'+
+ '<div class="f2"><label>Date * (click for calendar)<input type="date" name="date" required value="'+v.date+'"></label><label>Amount received (PKR) *<input type="number" step="any" min="0" name="amount" required value="'+esc(v.amount)+'"></label></div>'+
+ '<div class="f2"><label>Cheque / Cash *<select name="mode">'+['Cash','Cheque','Online Transfer'].map(m=>'<option'+(m===v.mode?' selected':'')+'>'+m+'</option>').join('')+'</select></label><label>Reference no.<input name="ref" value="'+esc(v.ref)+'"><div class="hint" id="rf">Required for cheques</div></label></div>'+
+ '<div class="f2"><label>Bank detail<input name="bank" value="'+esc(v.bank)+'" placeholder="Bank / account holder"></label><label>Slip date<input type="date" name="slip" value="'+esc(v.slip)+'"></label></div>'+
+ '<label>Note<input name="note" value="'+esc(v.note||'')+'"></label>',
+ d=>{
+  const amt=num(d.amount);if(amt<=0){toast('Enter the amount received');return false}
+  if(d.mode==='Cheque'&&!d.ref.trim()){toast('A cheque needs a reference number');return false}
+  const o={cid:d.cid,type:'payment',date:d.date,amount:Math.round(amt),mode:d.mode,bank:d.bank.trim(),slip:d.slip||d.date,ref:d.ref.trim(),note:d.note.trim()};
+  if(e)Object.assign(e,o);else DB.entries.push(Object.assign({id:'e'+DB.meta.nextEnt++,seq:DB.meta.seq++},o));
+  log((e?'Edited':'New')+' payment: '+cust(o.cid).name+' · '+money(o.amount)+' DR ('+o.mode+')');save();render();toast('Payment saved');
+ });
+}
+function delEntry(id){
+ const e=DB.entries.find(x=>x.id===id);
+ if(!confirm('Delete this '+(e.type==='supply'?'supply (serial '+e.serial+', '+invNo(e.invoice)+')':'payment')+' of '+money(e.amount)+'? A deleted serial / invoice number will show as MISSING on the dashboard.'))return;
+ log('Deleted '+e.type+' of '+money(e.amount)+' for '+(cust(e.cid)||{name:'?'}).name+(e.type==='supply'?' (serial '+e.serial+', '+invNo(e.invoice)+')':''));DB.entries=DB.entries.filter(x=>x.id!==id);save();render();toast('Entry deleted');
+}
+
+/* ============ Rates ============ */
+function viewRates(){
+ const cur=g=>{const r=rateFor(g,today());return r==null?'—':money(r)};
+ const hist=DB.rates.map((r,i)=>({r:r,i:i})).sort((a,b)=>a.r.grade.localeCompare(b.r.grade)||b.r.from.localeCompare(a.r.from));
+ return head('Steel Rates','سٹیل کے ریٹ','Add a NEW rate row whenever the price changes — old deliveries keep the rate they were saved with')+
+ '<div class="grid two"><div class="card"><h2>'+bi('Steel Grades','گریڈ')+'</h2><div class="tw"><table><thead><tr><th>Grade</th><th>Current Rate (PKR/MT)</th><th></th></tr></thead><tbody>'+
+ (DB.grades.length?DB.grades.map((g,i)=>'<tr><td>'+esc(g)+'</td><td class="n">'+cur(g)+'</td><td class="c"><button class="btn sm danger" onclick="delGrade('+i+')">✕</button></td></tr>').join(''):'<tr><td colspan="3" class="c">No grades</td></tr>')+'</tbody></table></div>'+
+ '<form class="bar" style="margin-top:12px" onsubmit="addGrade(this);return false"><input name="g" placeholder="New grade e.g. 0.8GP" required><button class="btn">Add grade</button></form></div>'+
+ '<div class="card"><h2>'+bi('Rate History','ریٹ کی تاریخ')+'</h2><div class="tw"><table><thead><tr><th>Grade</th><th>Effective From</th><th>Rate (PKR/MT)</th><th></th></tr></thead><tbody>'+
+ (hist.length?hist.map(h=>'<tr><td>'+esc(h.r.grade)+'</td><td class="c">'+fd8(h.r.from)+'</td><td class="n">'+money(h.r.rate)+'</td><td class="c"><button class="btn sm danger" onclick="delRate('+h.i+')">✕</button></td></tr>').join(''):'<tr><td colspan="4" class="c">No rates</td></tr>')+'</tbody></table></div>'+
+ '<form style="margin-top:12px" onsubmit="addRate(this);return false"><div class="f2"><label>Grade<select name="g" required>'+DB.grades.map(g=>'<option>'+esc(g)+'</option>').join('')+'</select></label><label>Effective from<input type="date" name="d" required value="'+today()+'"></label></div><div class="f2"><label>New rate (PKR / MT)<input type="number" step="any" min="1" name="r" required></label><label>&nbsp;<button class="btn" style="width:100%;margin-top:4px">Add rate</button></label></div></form></div></div>';
+}
+function addGrade(f){const g=f.g.value.trim();if(!g)return;if(DB.grades.some(x=>x.toLowerCase()===g.toLowerCase())){toast('Grade already exists');return}DB.grades.push(g);save();render()}
+function delGrade(i){if(!confirm('Remove grade "'+DB.grades[i]+'" from the list? Old entries are not affected.'))return;DB.grades.splice(i,1);save();render()}
+function addRate(f){DB.rates.push({grade:f.g.value,from:f.d.value,rate:num(f.r.value)});log('New rate '+f.g.value+' '+money(num(f.r.value))+' from '+fd8(f.d.value));save();render();toast('Rate added')}
+function delRate(i){if(!confirm('Delete this rate row?'))return;DB.rates.splice(i,1);save();render()}
+
+/* ============ Billing ============ */
+function viewBilling(){
+ const b=view.b||(view.b={cid:'',from:'',to:''});
+ let inv=DB.entries.filter(e=>e.type==='supply'&&(!b.cid||e.cid===b.cid)&&(!b.from||e.date>=b.from)&&(!b.to||e.date<=b.to)).sort((x,y)=>y.invoice-x.invoice);
+ return head('Billing','بلنگ','Invoices for every delivery, customer statements and the outstanding report')+
+ '<div class="card"><h2>'+bi('Customer Statements','اکاؤنٹ اسٹیٹمنٹ')+'</h2><form class="bar" onsubmit="return false"><select id="sc"><option value="">— choose customer —</option>'+custOptions('')+'</select><label style="margin:0">From <input type="date" id="sf"></label><label style="margin:0">To <input type="date" id="st"></label><button class="btn" onclick="stmtGo()">Print statement</button><button class="btn ghost" onclick="allStmtGo()">Print for ALL customers</button><button class="btn ghost" onclick="printOutstanding()">Outstanding report</button><button class="btn ghost" onclick="printAgeing()">Ageing report</button></form><div class="hint">Leave the dates empty for the full history.</div></div>'+
+ '<div class="card"><h2>'+bi('Invoices','انوائس')+'</h2><div class="bar"><select onchange="view.b.cid=this.value;render()"><option value="">All customers</option>'+custOptions(b.cid)+'</select><label style="margin:0">From <input type="date" value="'+b.from+'" onchange="view.b.from=this.value;render()"></label><label style="margin:0">To <input type="date" value="'+b.to+'" onchange="view.b.to=this.value;render()"></label><input id="is" placeholder="Search invoice / grade…" oninput="filt(\'is\',\'#itab tbody tr\')"><span class="sp"></span><span class="sub" style="margin:0">'+inv.length+' invoice(s) · '+money(sum(inv,e=>e.amount))+'</span></div><div class="tw"><table id="itab"><thead><tr><th>Invoice No.</th><th>Date</th><th>Customer</th><th>Serial</th><th>Item</th><th>Net Qty (MT)</th><th>Rate</th><th>Amount</th><th></th></tr></thead><tbody>'+
+ (inv.length?inv.map(e=>{const c=cust(e.cid);return '<tr data-s="'+esc((invNo(e.invoice)+' '+(c?c.name:'')+' '+e.grade).toLowerCase())+'"><td><b>'+invNo(e.invoice)+'</b></td><td class="c">'+fd8(e.date)+'</td><td>'+esc(c?c.name:'?')+'</td><td class="c">'+esc(e.serial)+'</td><td>'+esc(e.grade)+'</td><td class="n">'+qtyf(e.qty)+'</td><td class="n">'+money(e.rate)+'</td><td class="crc">'+money(e.amount)+' CR</td><td class="c"><button class="btn sm" onclick="printInvoice(\''+e.id+'\')">Print invoice</button></td></tr>'}).join(''):'<tr><td colspan="9" class="c" style="padding:20px">No invoices match.</td></tr>')+'</tbody></table></div></div>';
+}
+function stmtGo(){const c=$('#sc').value;if(!c){toast('Choose a customer');return}printStatement(c,$('#sf').value,$('#st').value)}
+function allStmtGo(){printSheets(DB.customers.map(c=>stmtHtml(c.id,$('#sf').value,$('#st').value)))}
+
+/* ============ print documents ============ */
+function urWrap(h){return h.replace(/[\u0600-\u06FF]+(?:[ \u00A0][\u0600-\u06FF]+)*/g,'<span class="ur">$&</span>')}
+function printSheets(arr){
+ arr=arr.map(urWrap);
+ $('#printRoot').innerHTML='<div class="pbar no-print"><button class="btn" onclick="window.print()">🖨 Print / Save as PDF</button><button class="btn ghost" onclick="closePrint()">Close</button></div>'+arr.map(h=>'<div class="sheet">'+h+'</div>').join('');
+ $('#printRoot').style.display='block';$('#printRoot').scrollTop=0;
+}
+function closePrint(){$('#printRoot').style.display='none';$('#printRoot').innerHTML=''}
+function docHead(titleEn,titleUr,extra){
+ const s=DB.settings;
+ return '<div class="hd"><div><div class="bn">'+esc(s.name)+'</div>'+(s.nameUr?'<div class="ur" style="font-size:18px">'+esc(s.nameUr)+'</div>':'')+'<div>'+esc(s.address)+'</div><div>'+(s.phone?'Phone / فون: '+esc(s.phone):'')+'</div></div><div><div class="ttl">'+titleEn+'<br><span class="ur">'+titleUr+'</span></div>'+(extra||'')+'</div></div>';
+}
+function printInvoice(eid){
+ const e=DB.entries.find(x=>x.id===eid),c=cust(e.cid),row=ledger(e.cid).find(x=>x.id===eid),prev=row.bal-e.amount,s=DB.settings;
+ printSheets(['<div>'+docHead('INVOICE','انوائس','<div style="text-align:right;margin-top:6px">Invoice No. / انوائس نمبر: <b>'+invNo(e.invoice)+'</b><br>Date / تاریخ: <b>'+fd8(e.date)+'</b></div>')+
+ '<div class="box" style="margin-bottom:14px"><b>Customer / گاہک:</b> '+esc(c.name)+'<br>'+esc([c.city,c.phone].filter(Boolean).join(' · '))+'</div>'+
+ '<table><thead><tr><th>Serial<span class="ur">نمبر</span></th><th>Description<span class="ur">تفصیل</span></th><th>Size<span class="ur">سائز</span></th><th>Net Qty (MT)<span class="ur">وزن</span></th><th>Rate (PKR/MT)<span class="ur">ریٹ</span></th><th>Amount (PKR)<span class="ur">رقم</span></th></tr></thead><tbody><tr><td class="c">'+esc(e.serial)+'</td><td>'+esc(e.grade)+'</td><td class="c">'+esc(e.size)+'</td><td class="n">'+qtyf(e.qty)+'</td><td class="n">'+money(e.rate)+'</td><td class="n"><b>'+money(e.amount)+'</b></td></tr></tbody></table>'+
+ (e.time?'<div style="margin-top:8px">Payment term / مدت: <b>'+esc(e.time)+'</b></div>':'')+
+ '<div class="sum"><div><span>Previous balance / سابقہ بقایا</span><span>'+bal2(prev)+'</span></div><div><span>This invoice / یہ انوائس</span><span>'+money(e.amount)+' CR</span></div><div class="tot"><span>Current balance / موجودہ بقایا</span><span>'+bal2(row.bal)+'</span></div></div>'+
+ (s.bank?'<div class="box" style="margin-top:18px"><b>Bank details / بینک تفصیل</b><br>'+esc(s.bank).replace(/\n/g,'<br>')+'</div>':'')+
+ '<div class="sig"><div>Customer signature<br><span class="ur">دستخط گاہک</span></div><div>Authorised signature<br><span class="ur">دستخط</span></div></div></div>']);
+}
+const bal2=b=>b>0?money(b)+' CR':b<0?money(-b)+' DR':'0';
+function stmtHtml(cid,from,to){
+ const c=cust(cid),all=ledger(cid);
+ const before=from?all.filter(e=>e.date<from):[];
+ const open=before.length?before[before.length-1].bal:num(c.opening);
+ const rows=all.filter(e=>(!from||e.date>=from)&&(!to||e.date<=to));
+ const cr=sum(rows.filter(e=>e.type==='supply'),e=>e.amount),dr=sum(rows.filter(e=>e.type==='payment'),e=>e.amount);
+ let bal=open;
+ const body=rows.map(e=>{bal+=e.type==='supply'?e.amount:-e.amount;
+  const d=e.type==='supply'?esc(e.grade)+(e.size?' ('+esc(e.size)+')':'')+' — '+qtyf(e.qty)+' MT @ '+money(e.rate)+' · '+invNo(e.invoice):'Payment — '+esc(e.mode)+(e.ref?' #'+esc(e.ref):'')+(e.bank?' · '+esc(e.bank):'');
+  return '<tr><td class="c">'+fd8(e.date)+'</td><td class="c">'+(e.type==='supply'?esc(e.serial):'')+'</td><td style="white-space:normal">'+d+'</td><td class="n">'+(e.type==='supply'?money(e.amount):'')+'</td><td class="n">'+(e.type==='payment'?money(e.amount):'')+'</td><td class="n">'+bal2(bal)+'</td></tr>'}).join('');
+ return docHead('STATEMENT OF ACCOUNT','اکاؤنٹ اسٹیٹمنٹ','<div style="text-align:right;margin-top:6px">Period / مدت: <b>'+(from?fd8(from):'Beginning')+' → '+(to?fd8(to):fd8(today()))+'</b></div>')+
+ '<div class="box" style="margin-bottom:14px"><b>Customer / گاہک:</b> '+esc(c.name)+'<br>'+esc([c.city,c.phone].filter(Boolean).join(' · '))+'</div>'+
+ '<table><thead><tr><th>Date<span class="ur">تاریخ</span></th><th>Serial<span class="ur">نمبر</span></th><th>Details<span class="ur">تفصیل</span></th><th>Credit CR<span class="ur">ادھار</span></th><th>Debit DR<span class="ur">وصولی</span></th><th>Balance<span class="ur">بقایا</span></th></tr></thead><tbody>'+
+ '<tr><td colspan="5"><b>Opening balance / ابتدائی بقایا</b></td><td class="n"><b>'+bal2(open)+'</b></td></tr>'+body+
+ '</tbody><tfoot><tr><td colspan="3">TOTAL / کل</td><td class="n">'+money(cr)+'</td><td class="n">'+money(dr)+'</td><td class="n">'+bal2(bal)+'</td></tr></tfoot></table>'+
+ '<div class="sum"><div class="tot"><span>Closing balance / اختتامی بقایا</span><span>'+bal2(bal)+'</span></div></div>'+
+ (DB.settings.bank?'<div class="box" style="margin-top:16px"><b>Bank details / بینک تفصیل</b><br>'+esc(DB.settings.bank).replace(/\n/g,'<br>')+'</div>':'')+
+ '<div class="sig"><div>Customer signature<br><span class="ur">دستخط گاہک</span></div><div>Authorised signature<br><span class="ur">دستخط</span></div></div>';
+}
+function printStatement(cid,from,to){printSheets([stmtHtml(cid,from,to)])}
+function printOutstanding(){
+ const rows=DB.customers.map(c=>({c:c,b:balanceOf(c.id)})).sort((a,b)=>b.b-a.b);
+ printSheets([docHead('OUTSTANDING REPORT','بقایا رپورٹ','<div style="text-align:right;margin-top:6px">As on / بتاریخ: <b>'+fd8(today())+'</b></div>')+
+ '<table><thead><tr><th>#</th><th>Customer<span class="ur">گاہک</span></th><th>City<span class="ur">شہر</span></th><th>Balance<span class="ur">بقایا</span></th></tr></thead><tbody>'+rows.map((r,i)=>'<tr><td class="c">'+(i+1)+'</td><td>'+esc(r.c.name)+'</td><td>'+esc(r.c.city)+'</td><td class="n">'+bal2(r.b)+'</td></tr>').join('')+'</tbody><tfoot><tr><td colspan="3">TOTAL RECEIVABLE / کل وصولی</td><td class="n">'+money(sum(rows.filter(r=>r.b>0),r=>r.b))+' CR</td></tr></tfoot></table>']);
+}
+
+/* ============ Activity log ============ */
+function log(m){DB.log.unshift({t:new Date().toISOString(),m:m});if(DB.log.length>500)DB.log.length=500}
+const addDays=(iso,n)=>{const d=new Date(iso+'T00:00:00');d.setDate(d.getDate()+n);return new Date(d.getTime()-d.getTimezoneOffset()*60000).toISOString().slice(0,10)};
+
+/* ============ Credit ageing (oldest invoices are paid first) ============ */
+function daysSince(iso){return Math.floor((new Date(today())-new Date(iso))/864e5)}
+function ageing(cid){
+ const c=cust(cid),es=entriesOf(cid);
+ let pay=sum(es.filter(e=>e.type==='payment'),e=>e.amount);
+ const op=num(c.opening),layers=[];
+ if(op>0)layers.push({open:true,amt:op});else pay+=-op;
+ es.filter(e=>e.type==='supply').forEach(e=>layers.push({date:e.date,amt:e.amount}));
+ const r={b0:0,b1:0,b2:0,b3:0,open:0,total:0,overdue:0,adv:0},lim=num(c.days)||30;
+ layers.forEach(l=>{
+  const t=Math.min(l.amt,pay);l.rem=l.amt-t;pay-=t;
+  if(l.rem<=0)return;
+  r.total+=l.rem;
+  if(l.open){r.open+=l.rem;r.overdue+=l.rem;return}
+  const a=daysSince(l.date);
+  r[a<=30?'b0':a<=60?'b1':a<=90?'b2':'b3']+=l.rem;
+  if(a>lim)r.overdue+=l.rem;
+ });
+ r.adv=pay;return r;
+}
+function ageingAll(){const t={b0:0,b1:0,b2:0,b3:0,open:0,total:0,overdue:0};DB.customers.forEach(c=>{const a=ageing(c.id);Object.keys(t).forEach(k=>t[k]+=a[k])});return t}
+function printAgeing(){
+ const rows=DB.customers.map(c=>({c:c,a:ageing(c.id)})).filter(r=>r.a.total>0).sort((x,y)=>y.a.total-x.a.total),t=ageingAll();
+ const m=v=>v?money(v):'-';
+ printSheets([docHead('RECEIVABLES AGEING REPORT','بقایا جات کی عمر کی رپورٹ','<div style="text-align:right;margin-top:6px">As on / بتاریخ: <b>'+fd8(today())+'</b></div>')+
+ '<table><thead><tr><th>Customer<span class="ur">گاہک</span></th><th>0–30 days<span class="ur">۳۰ دن تک</span></th><th>31–60<span class="ur">۶۰ دن تک</span></th><th>61–90<span class="ur">۹۰ دن تک</span></th><th>Over 90<span class="ur">۹۰ سے زیادہ</span></th><th>Opening<span class="ur">ابتدائی</span></th><th>Total<span class="ur">کل</span></th><th>Overdue<span class="ur">مدت گزر چکی</span></th></tr></thead><tbody>'+
+ (rows.length?rows.map(r=>'<tr><td>'+esc(r.c.name)+'</td><td class="n">'+m(r.a.b0)+'</td><td class="n">'+m(r.a.b1)+'</td><td class="n">'+m(r.a.b2)+'</td><td class="n">'+m(r.a.b3)+'</td><td class="n">'+m(r.a.open)+'</td><td class="n"><b>'+money(r.a.total)+'</b></td><td class="n">'+m(r.a.overdue)+'</td></tr>').join(''):'<tr><td colspan="8" class="c">No outstanding balances</td></tr>')+
+ '</tbody><tfoot><tr><td>TOTAL</td><td class="n">'+m(t.b0)+'</td><td class="n">'+m(t.b1)+'</td><td class="n">'+m(t.b2)+'</td><td class="n">'+m(t.b3)+'</td><td class="n">'+m(t.open)+'</td><td class="n">'+money(t.total)+'</td><td class="n">'+m(t.overdue)+'</td></tr></tfoot></table><div class="hint" style="margin-top:8px">Payments are applied to the oldest invoices first. Overdue = older than the customer\'s credit days. Opening balances are counted as overdue.</div>']);
+}
+
+/* ============ Stock, heat numbers, margin ============ */
+function stockInfo(grade){
+ const g=String(grade).trim().toLowerCase();
+ const P=DB.purchases.filter(p=>p.grade.toLowerCase()===g),S=DB.entries.filter(e=>e.type==='supply'&&String(e.grade).toLowerCase()===g);
+ const inn=sum(P,p=>p.qty),out=sum(S,e=>e.qty);
+ return {tracked:P.length>0,inn:inn,out:out,stock:inn-out,cost:inn?sum(P,p=>p.qty*p.rate)/inn:null,sold:out?sum(S,e=>e.amount)/out:null};
+}
+function profit(ym){
+ let p=0,known=false;
+ DB.entries.filter(e=>e.type==='supply'&&(!ym||(e.date||'').startsWith(ym))).forEach(e=>{const s=stockInfo(e.grade);if(s.cost!=null){known=true;p+=e.amount-e.qty*s.cost}});
+ return {p:p,known:known};
+}
+function ensureGrade(g,date,rate){
+ if(!DB.grades.some(x=>x.toLowerCase()===g.toLowerCase()))DB.grades.push(g);
+ if(rate&&!DB.rates.some(r=>r.grade.toLowerCase()===g.toLowerCase()))DB.rates.push({grade:g,from:date,rate:rate});
+}
+function setMin(g,v){DB.gradeMin[g]=num(v);save();render()}
+function viewStock(){
+ const rows=DB.grades.map(g=>({g:g,s:stockInfo(g),min:num(DB.gradeMin[g])}));
+ const tracked=rows.filter(r=>r.s.tracked);
+ const val=sum(tracked,r=>Math.max(0,r.s.stock)*r.s.cost);
+ const low=tracked.filter(r=>r.s.stock<0||(r.min>0&&r.s.stock<=r.min)).length;
+ const P=DB.purchases.slice().sort((a,b)=>b.date.localeCompare(a.date)||b.no-a.no);
+ const D=DB.entries.filter(e=>e.type==='supply'&&(e.heat||e.vehicle)).sort((a,b)=>b.seq-a.seq);
+ return head('Stock & Heat Numbers','اسٹاک اور ہیٹ نمبر','Steel bought and delivered by grade. In stock = purchases − deliveries. Record purchases to switch tracking on for a grade.')+
+ '<div class="grid kpis">'+kpi('Grades tracked',tracked.length+' / '+rows.length,'have purchases recorded','')+kpi('Total in stock',qtyf(sum(tracked,r=>r.s.stock))+' MT','tracked grades','gold')+kpi('Stock value',money(val),'at average purchase cost','')+kpi('Low / over-delivered',low,'grades need attention',low?'red':'green')+'</div>'+
+ '<div class="card"><h2>'+bi('Stock by Grade','گریڈ کے مطابق اسٹاک')+'</h2><div class="tw"><table><thead><tr><th>Grade</th><th>Purchased (MT)</th><th>Delivered (MT)</th><th>In Stock (MT)</th><th>Avg Cost /MT</th><th>Avg Sale /MT</th><th>Est. Margin</th><th>Alert when stock ≤ (MT)</th><th>Status</th></tr></thead><tbody>'+
+ rows.map(r=>{const s=r.s;const st=!s.tracked?'<span class="pill on" style="background:#EDF1F7;color:#5d6b82">Not tracked</span>':s.stock<0?'<span class="pill" style="background:#FDECEC;color:#C00000">Over-delivered</span>':(r.min>0&&s.stock<=r.min)?'<span class="pill on">LOW STOCK</span>':'<span class="pill cash">OK</span>';
+  const mg=s.cost!=null&&s.sold?((s.sold-s.cost)/s.sold*100):null;
+  return '<tr><td><b>'+esc(r.g)+'</b></td><td class="n">'+(s.tracked?qtyf(s.inn):'—')+'</td><td class="n">'+qtyf(s.out)+'</td><td class="n"><b>'+(s.tracked?qtyf(s.stock):'—')+'</b></td><td class="n">'+(s.cost!=null?money(s.cost):'—')+'</td><td class="n">'+(s.sold?money(s.sold):'—')+'</td><td class="n '+(mg==null?'':mg>=0?'dr':'cr')+'">'+(mg==null?'—':mg.toFixed(1)+'%')+'</td><td class="c"><input type="number" step="any" min="0" style="width:90px" value="'+(r.min||'')+'" onchange="setMin(\''+esc(r.g).replace(/'/g,"\\'")+'\',this.value)"></td><td class="c">'+st+'</td></tr>'}).join('')+
+ '</tbody></table></div><div class="hint">Margin is an estimate: average sale rate vs average purchase cost of the grade.</div></div>'+
+ '<div class="card"><h2>'+bi('Purchases (Stock In)','خریداری')+'</h2><div class="bar"><input id="hs" placeholder="Search heat / lot no, supplier, grade…" style="min-width:280px" oninput="filt(\'hs\',\'.hrow\')"><span class="sp"></span><button class="btn" onclick="modalPurchase()">+ Add Purchase</button></div><div class="tw"><table><thead><tr><th>Date</th><th>Supplier</th><th>Grade</th><th>Size</th><th>Qty (MT)</th><th>Cost Rate /MT</th><th>Total Cost</th><th>Heat / Lot No.</th><th>Mill Cert No.</th><th></th></tr></thead><tbody>'+
+ (P.length?P.map(p=>'<tr class="hrow" data-s="'+esc((p.heat+' '+p.supplier+' '+p.grade+' '+p.cert).toLowerCase())+'"><td class="c">'+fd8(p.date)+'</td><td>'+esc(p.supplier)+'</td><td>'+esc(p.grade)+'</td><td class="c">'+esc(p.size)+'</td><td class="n">'+qtyf(p.qty)+'</td><td class="n">'+money(p.rate)+'</td><td class="n">'+money(p.qty*p.rate)+'</td><td class="c"><b>'+esc(p.heat)+'</b></td><td class="c">'+esc(p.cert)+'</td><td class="c"><button class="btn sm ghost" onclick="modalPurchase(\''+p.id+'\')">Edit</button> <button class="btn sm danger" onclick="delPurchase(\''+p.id+'\')">✕</button></td></tr>').join(''):'<tr><td colspan="10" class="c" style="padding:18px">No purchases yet. Click “Add Purchase”.</td></tr>')+'</tbody></table></div></div>'+
+ '<div class="card"><h2>'+bi('Deliveries with Heat / Vehicle','ہیٹ اور گاڑی کے ساتھ ڈلیوری')+'</h2><div class="tw"><table><thead><tr><th>Date</th><th>Customer</th><th>Grade</th><th>Qty (MT)</th><th>Heat / Lot No.</th><th>Vehicle No.</th><th>Invoice</th></tr></thead><tbody>'+
+ (D.length?D.map(e=>{const c=cust(e.cid);return '<tr class="hrow" data-s="'+esc(((e.heat||'')+' '+(c?c.name:'')+' '+e.grade+' '+(e.vehicle||'')).toLowerCase())+'"><td class="c">'+fd8(e.date)+'</td><td>'+esc(c?c.name:'?')+'</td><td>'+esc(e.grade)+'</td><td class="n">'+qtyf(e.qty)+'</td><td class="c"><b>'+esc(e.heat)+'</b></td><td class="c">'+esc(e.vehicle)+'</td><td class="c">'+invNo(e.invoice)+'</td></tr>'}).join(''):'<tr><td colspan="7" class="c" style="padding:18px">Enter a heat / lot number or vehicle number on a delivery and it will appear here.</td></tr>')+'</tbody></table></div></div>';
+}
+function modalPurchase(id){
+ const p=id?DB.purchases.find(x=>x.id===id):{date:today(),supplier:'',grade:'',size:'',qty:'',rate:'',heat:'',cert:'',note:''};
+ openModal((id?'Edit':'New')+' Purchase (Stock In)',
+ '<div class="f2"><label>Date *<input type="date" name="date" required value="'+p.date+'"></label><label>Supplier<input name="supplier" value="'+esc(p.supplier)+'"></label></div>'+
+ '<div class="f2"><label>Steel grade *<input name="grade" list="gl2" required autocomplete="off" value="'+esc(p.grade)+'"><datalist id="gl2">'+DB.grades.map(g=>'<option value="'+esc(g)+'">').join('')+'</datalist></label><label>Size<input name="size" value="'+esc(p.size)+'"></label></div>'+
+ '<div class="f2"><label>Quantity (MT) *<input type="number" step="any" min="0" name="qty" required value="'+esc(p.qty)+'"></label><label>Cost rate (PKR / MT) *<input type="number" step="any" min="0" name="rate" required value="'+esc(p.rate)+'"></label></div>'+
+ '<div class="f2"><label>Heat / Lot no.<input name="heat" value="'+esc(p.heat)+'"></label><label>Mill test certificate no.<input name="cert" value="'+esc(p.cert)+'"></label></div>'+
+ '<label>Note<input name="note" value="'+esc(p.note||'')+'"></label>',
+ d=>{
+  const qty=num(d.qty),rate=num(d.rate);if(!d.grade.trim()||qty<=0||rate<=0){toast('Enter grade, quantity and cost rate');return false}
+  const o={date:d.date,supplier:d.supplier.trim(),grade:d.grade.trim(),size:d.size.trim(),qty:qty,rate:rate,heat:d.heat.trim(),cert:d.cert.trim(),note:d.note.trim()};
+  ensureGrade(o.grade,o.date,0);
+  if(id)Object.assign(p,o);else DB.purchases.push(Object.assign({id:'p'+DB.meta.nextPur,no:DB.meta.nextPur++},o));
+  log((id?'Edited':'New')+' purchase: '+o.grade+' '+qtyf(qty)+' MT'+(o.heat?' heat '+o.heat:''));save();render();toast('Purchase saved');
+ });
+}
+function delPurchase(id){const p=DB.purchases.find(x=>x.id===id);if(!confirm('Delete this purchase of '+qtyf(p.qty)+' MT '+p.grade+'?'))return;DB.purchases=DB.purchases.filter(x=>x.id!==id);log('Deleted purchase: '+p.grade+' '+qtyf(p.qty)+' MT');save();render()}
+
+/* ============ Quotations ============ */
+const qNo=n=>'QT-'+String(n).padStart(4,'0');
+const qTotal=q=>sum(q.lines,l=>Math.round(l.qty*l.rate));
+function qStatus(q){return q.status==='converted'?'Converted':q.status==='lost'?'Lost':(q.valid&&q.valid<today()?'Expired':'Open')}
+function viewQuotes(){
+ const Q=DB.quotes.slice().sort((a,b)=>b.no-a.no),open=Q.filter(q=>qStatus(q)==='Open');
+ const pill=s=>'<span class="pill '+(s==='Converted'?'cash':s==='Open'?'chq':'on')+'">'+s+'</span>';
+ return head('Quotations','کوٹیشن','Send a price quote, then convert it into deliveries (and invoices) in one click')+
+ '<div class="grid kpis">'+kpi('Open quotes',open.length,money(sum(open,qTotal))+' PKR','gold')+kpi('Converted',Q.filter(q=>q.status==='converted').length,'became deliveries','green')+kpi('Total quotes',Q.length,'','')+'</div>'+
+ '<div class="bar"><span class="sp"></span><button class="btn" onclick="modalQuote()">+ New Quotation</button></div><div class="card tw"><table><thead><tr><th>Quote No.</th><th>Date</th><th>Valid Until</th><th>Customer</th><th>Items</th><th>Total (PKR)</th><th>Status</th><th></th></tr></thead><tbody>'+
+ (Q.length?Q.map(q=>{const c=cust(q.cid),st=qStatus(q);return '<tr><td><b>'+qNo(q.no)+'</b></td><td class="c">'+fd8(q.date)+'</td><td class="c">'+fd8(q.valid)+'</td><td>'+esc(c?c.name:'?')+'</td><td>'+esc(q.lines.map(l=>l.grade+' '+qtyf(l.qty)+'MT').join(', '))+'</td><td class="n"><b>'+money(qTotal(q))+'</b></td><td class="c">'+pill(st)+'</td><td><button class="btn sm ghost" onclick="printQuote(\''+q.id+'\')">Print</button> '+(q.status==='converted'?'':'<button class="btn sm green" onclick="convertQuote(\''+q.id+'\')">Convert to delivery</button> <button class="btn sm ghost" onclick="modalQuote(\''+q.id+'\')">Edit</button> ')+'<button class="btn sm danger" onclick="delQuote(\''+q.id+'\')">✕</button></td></tr>'}).join(''):'<tr><td colspan="8" class="c" style="padding:22px">No quotations yet.</td></tr>')+'</tbody></table></div>';
+}
+function modalQuote(id){
+ if(!DB.customers.length){toast('Add a customer first');return}
+ const q=id?DB.quotes.find(x=>x.id===id):{cid:DB.customers[0].id,date:today(),valid:addDays(today(),7),lines:[],note:''};
+ let rows='<div class="f4" style="font-size:11px;font-weight:bold;color:#1F3A5F"><span>Steel grade</span><span>Size</span><span>Qty (MT)</span><span>Rate /MT</span></div>';
+ for(let i=0;i<5;i++){const l=q.lines[i]||{};rows+='<div class="f4"><input name="g'+i+'" list="gl3" autocomplete="off" value="'+esc(l.grade)+'"><input name="s'+i+'" value="'+esc(l.size)+'"><input name="q'+i+'" type="number" step="any" min="0" value="'+esc(l.qty)+'"><input name="r'+i+'" type="number" step="any" min="0" value="'+esc(l.rate)+'"></div>'}
+ const f=openModal((id?'Edit ':'New ')+'Quotation',
+ '<label>Customer *<select name="cid">'+custOptions(q.cid)+'</select></label><div class="f2"><label>Date *<input type="date" name="date" required value="'+q.date+'"></label><label>Valid until<input type="date" name="valid" value="'+esc(q.valid)+'"></label></div>'+rows+'<datalist id="gl3">'+DB.grades.map(g=>'<option value="'+esc(g)+'">').join('')+'</datalist><label style="margin-top:8px">Note / terms<input name="note" value="'+esc(q.note||'')+'" placeholder="e.g. Ex-godown, payment 20 days"></label><div class="hint">Fill one line per steel grade. Rate fills in from the rate list; you can change it.</div>',
+ d=>{
+  const lines=[];for(let i=0;i<5;i++){const g=(d['g'+i]||'').trim(),qq=num(d['q'+i]),r=num(d['r'+i]);if(g&&qq>0&&r>0)lines.push({grade:g,size:(d['s'+i]||'').trim(),qty:qq,rate:r})}
+  if(!lines.length){toast('Add at least one line with grade, qty and rate');return false}
+  const o={cid:d.cid,date:d.date,valid:d.valid,lines:lines,note:d.note.trim()};
+  if(id)Object.assign(q,o);else DB.quotes.push(Object.assign({id:'q'+DB.meta.nextQuote,no:DB.meta.nextQuote++,status:'open'},o));
+  log((id?'Edited':'New')+' quotation '+qNo(id?q.no:DB.meta.nextQuote-1));save();render();toast('Quotation saved');
+ });
+ for(let i=0;i<5;i++){const r=f.elements['r'+i];if(r.value)r.dataset.m=1;r.oninput=()=>{r.dataset.m=1};
+  f.elements['g'+i].oninput=()=>{const v=rateFor(f.elements['g'+i].value,f.elements.date.value);if(v!=null&&!r.dataset.m)r.value=v}}
+}
+function delQuote(id){const q=DB.quotes.find(x=>x.id===id);if(!confirm('Delete quotation '+qNo(q.no)+'?'))return;DB.quotes=DB.quotes.filter(x=>x.id!==id);log('Deleted quotation '+qNo(q.no));save();render()}
+function createSupply(o){
+ const e=Object.assign({type:'supply',serial:nextSerial(o.cid),size:'',time:'',note:'',heat:'',vehicle:''},o);
+ e.id='e'+DB.meta.nextEnt++;e.seq=DB.meta.seq++;e.invoice=DB.meta.nextInv++;e.amount=Math.round(e.qty*e.rate);
+ DB.entries.push(e);ensureGrade(e.grade,e.date,e.rate);return e;
+}
+function convertQuote(id){
+ const q=DB.quotes.find(x=>x.id===id),c=cust(q.cid),tot=qTotal(q);
+ let msg='Create '+q.lines.length+' delivery entr'+(q.lines.length>1?'ies':'y')+' (and invoices) for '+c.name+' worth '+money(tot)+', dated today?';
+ if(num(c.limit)>0&&balanceOf(c.id)+tot>num(c.limit))msg+='\n\n⚠ This will exceed the customer\'s credit limit of '+money(c.limit)+'.';
+ if(!confirm(msg))return;
+ q.entries=q.lines.map(l=>createSupply({cid:q.cid,date:today(),grade:l.grade,size:l.size,qty:l.qty,rate:l.rate,note:'From '+qNo(q.no)}).id);
+ q.status='converted';log('Converted '+qNo(q.no)+' into '+q.lines.length+' delivery entr'+(q.lines.length>1?'ies':'y'));save();nav('customer',q.cid);toast('Quotation converted');
+}
+function printQuote(id){
+ const q=DB.quotes.find(x=>x.id===id),c=cust(q.cid);
+ printSheets([docHead('QUOTATION','کوٹیشن','<div style="text-align:right;margin-top:6px">Quote No. / کوٹیشن نمبر: <b>'+qNo(q.no)+'</b><br>Date / تاریخ: <b>'+fd8(q.date)+'</b>'+(q.valid?'<br>Valid until / میعاد: <b>'+fd8(q.valid)+'</b>':'')+'</div>')+
+ '<div class="box" style="margin-bottom:14px"><b>To / گاہک:</b> '+esc(c.name)+'<br>'+esc([c.city,c.phone].filter(Boolean).join(' · '))+'</div>'+
+ '<table><thead><tr><th>#</th><th>Description<span class="ur">تفصیل</span></th><th>Size<span class="ur">سائز</span></th><th>Net Qty (MT)<span class="ur">وزن</span></th><th>Rate (PKR/MT)<span class="ur">ریٹ</span></th><th>Amount (PKR)<span class="ur">رقم</span></th></tr></thead><tbody>'+
+ q.lines.map((l,i)=>'<tr><td class="c">'+(i+1)+'</td><td>'+esc(l.grade)+'</td><td class="c">'+esc(l.size)+'</td><td class="n">'+qtyf(l.qty)+'</td><td class="n">'+money(l.rate)+'</td><td class="n">'+money(l.qty*l.rate)+'</td></tr>').join('')+
+ '</tbody><tfoot><tr><td colspan="3">TOTAL / کل</td><td class="n">'+qtyf(sum(q.lines,l=>l.qty))+'</td><td></td><td class="n">'+money(qTotal(q))+'</td></tr></tfoot></table>'+
+ (q.note?'<div style="margin-top:10px"><b>Terms / شرائط:</b> '+esc(q.note)+'</div>':'')+
+ '<div class="sig"><div>Customer acceptance<br><span class="ur">منظوری گاہک</span></div><div>Authorised signature<br><span class="ur">دستخط</span></div></div>']);
+}
+
+/* ============ Delivery challan ============ */
+function printChallan(eid){
+ const e=DB.entries.find(x=>x.id===eid),c=cust(e.cid);
+ printSheets([docHead('DELIVERY CHALLAN','ڈلیوری چالان','<div style="text-align:right;margin-top:6px">Challan No. / چالان نمبر: <b>DC-'+String(e.invoice).padStart(4,'0')+'</b><br>Date / تاریخ: <b>'+fd8(e.date)+'</b></div>')+
+ '<div class="box" style="margin-bottom:14px"><b>Deliver to / گاہک:</b> '+esc(c.name)+'<br>'+esc([c.city,c.phone].filter(Boolean).join(' · '))+'</div>'+
+ '<table><thead><tr><th>Serial<span class="ur">نمبر</span></th><th>Description<span class="ur">تفصیل</span></th><th>Size<span class="ur">سائز</span></th><th>Heat / Lot No.<span class="ur">ہیٹ لاٹ نمبر</span></th><th>Net Qty (MT)<span class="ur">وزن</span></th></tr></thead><tbody><tr><td class="c">'+esc(e.serial)+'</td><td>'+esc(e.grade)+'</td><td class="c">'+esc(e.size)+'</td><td class="c">'+esc(e.heat)+'</td><td class="n"><b>'+qtyf(e.qty)+'</b></td></tr></tbody></table>'+
+ '<div class="box" style="margin-top:14px">Vehicle no. / گاڑی نمبر: <b>'+esc(e.vehicle||'________________')+'</b> &nbsp;&nbsp;&nbsp; Driver / ڈرائیور: ________________</div>'+
+ '<div style="margin-top:10px">Invoice ref. / انوائس: <b>'+invNo(e.invoice)+'</b> · Goods received in good condition.</div>'+
+ '<div class="sig"><div>Driver signature<br><span class="ur">دستخط ڈرائیور</span></div><div>Receiver signature<br><span class="ur">دستخط وصول کنندہ</span></div></div>']);
+}
+
+/* ============ Settings / backup ============ */
+function viewSettings(){
+ const s=DB.settings;
+ return head('Settings & Backup','سیٹنگز','Your business details appear on every invoice and statement')+
+ '<div class="card"><h2>'+bi('Business Details','کاروبار کی تفصیل')+'</h2><form onsubmit="saveSettings(this);return false"><div class="f2"><label>Business name (English) *<input name="name" required value="'+esc(s.name)+'"></label><label>Business name (Urdu)<input name="nameUr" class="ur" value="'+esc(s.nameUr)+'"></label></div><div class="f2"><label>Address<input name="address" value="'+esc(s.address)+'"></label><label>Phone<input name="phone" value="'+esc(s.phone)+'"></label></div><div class="f2"><label>Bank details (printed on bills)<textarea name="bank" rows="3">'+esc(s.bank)+'</textarea></label><label>Invoice prefix<input name="invPrefix" value="'+esc(s.invPrefix)+'"><div class="hint">Next invoice no.: '+invNo(DB.meta.nextInv)+'</div></label></div><button class="btn">Save settings</button></form></div>'+
+ '<div class="card"><h2>'+bi('Backup & Restore','بیک اپ')+'</h2><p class="sub">Your data is stored inside this browser on this computer. Make a backup file regularly and keep a copy on a USB / email / Google Drive. '+(DB.meta.lastBackup?'Last backup: <b>'+fd8(DB.meta.lastBackup.slice(0,10))+'</b>.':'<b>No backup made yet.</b>')+'</p><div class="bar"><button class="btn" onclick="backup()">⬇ Download backup (JSON)</button><button class="btn ghost" onclick="exportAllCsv()">⬇ Export all entries (Excel/CSV)</button><label class="btn ghost" style="margin:0;cursor:pointer">⬆ Restore from backup<input type="file" accept=".json" style="display:none" onchange="restore(this)"></label></div></div>'+
+ '<div class="card"><h2>'+bi('Activity Log','تبدیلیوں کا ریکارڈ')+'</h2><div class="tw" style="max-height:320px;overflow:auto"><table><thead><tr><th>When</th><th>What</th></tr></thead><tbody>'+(DB.log.slice(0,100).map(l=>'<tr><td>'+esc(new Date(l.t).toLocaleString())+'</td><td style="white-space:normal">'+esc(l.m)+'</td></tr>').join('')||'<tr><td colspan="2" class="c">No activity yet</td></tr>')+'</tbody></table></div></div>'+
+'<div class="card"><h2>Danger zone</h2><button class="btn danger" onclick="resetAll()">Erase all data</button></div>';
+}
+function saveSettings(f){DB.settings={name:f.name.value.trim(),nameUr:f.nameUr.value.trim(),address:f.address.value.trim(),phone:f.phone.value.trim(),bank:f.bank.value.trim(),invPrefix:f.invPrefix.value.trim()||'INV-'};save();render();toast('Settings saved')}
+function download(name,text,mime){const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([text],{type:mime}));a.download=name;document.body.appendChild(a);a.click();setTimeout(()=>{URL.revokeObjectURL(a.href);a.remove()},500)}
+function backup(){DB.meta.lastBackup=new Date().toISOString();save();download('SteelLedger_backup_'+today()+'.json',JSON.stringify(DB,null,1),'application/json');render();toast('Backup downloaded')}
+function restore(inp){
+ const f=inp.files[0];if(!f)return;const r=new FileReader();
+ r.onload=()=>{try{const d=JSON.parse(r.result);if(!d||!Array.isArray(d.customers)||!Array.isArray(d.entries))throw 0;
+  if(!confirm('Replace ALL current data with this backup ('+d.customers.length+' customers, '+d.entries.length+' entries)?'))return;DB=migrate(d);log('Restored from backup');save();nav('dashboard');toast('Backup restored')}catch(e){toast('That is not a valid backup file')}};
+ r.readAsText(f);inp.value='';
+}
+function resetAll(){if(!confirm('Erase ALL customers and entries? Download a backup first!'))return;if(!confirm('Really erase everything?'))return;DB=migrate(seed());DB.customers=[];DB.entries=[];DB.meta.nextInv=1;DB.meta.nextEnt=1;DB.meta.seq=1;DB.meta.nextCust=1;save();nav('dashboard')}
+const CSVH=['Serial','Date','Item Description','Net Qty (MT)','Size','Rate (PKR/MT)','Amount (PKR)','Bank Detail','Slip Date','Cheque / Cash','Reference No','Credit Amount','Debit Amount','Time Period','Balance Amount'];
+function csvRows(cid){return ledger(cid).map(e=>{const s=e.type==='supply';return [s?e.serial:'',e.date,s?e.grade:'Payment',s?e.qty:'',s?e.size:'',s?e.rate:'',s?e.amount:'',s?'':e.bank,s?'':e.slip,s?'':e.mode,s?'':e.ref,s?e.amount:'',s?'':e.amount,s?e.time:'',e.bal]})}
+function exportCustomerCsv(cid){const c=cust(cid);download(c.name.replace(/[^\w]+/g,'_')+'_ledger.csv','﻿'+[CSVH].concat(csvRows(cid)).map(r=>r.map(csvq).join(',')).join('\r\n'),'text/csv')}
+function exportAllCsv(){const h=['Customer'].concat(CSVH);let rows=[h];DB.customers.forEach(c=>csvRows(c.id).forEach(r=>rows.push([c.name].concat(r))));download('All_customers_ledger_'+today()+'.csv','﻿'+rows.map(r=>r.map(csvq).join(',')).join('\r\n'),'text/csv')}
+
+/* ============ Login, roles, admin panel ============ */
+const AK='steelLedgerPro_auth';
+let AUTH=null;try{AUTH=JSON.parse(localStorage.getItem(AK))}catch(e){}
+const saveA=()=>{try{localStorage.setItem(AK,JSON.stringify(AUTH))}catch(e){}};
+let ME=null;const DEF=['dashboard','customers','rates','quotes','stock','billing'],DEFE=['customers','rates','quotes','stock'];const isAdmin=()=>!!ME&&ME.role==='admin';const can=v=>!!ME&&(ME.role==='admin'||(ME.perm||DEF).includes(v));const canEdit=v=>!!ME&&can(v)&&(ME.role==='admin'||(ME.edit||DEFE).includes(v));const isOwner=()=>!!ME&&!!AUTH&&ME.u===AUTH.users[0].u;
+async function H(p,salt){
+ if(window.crypto&&crypto.subtle){const te=new TextEncoder(),k=await crypto.subtle.importKey('raw',te.encode(p),'PBKDF2',false,['deriveBits']);
+  const b=await crypto.subtle.deriveBits({name:'PBKDF2',salt:te.encode(salt),iterations:100000,hash:'SHA-256'},k,256);
+  return Array.from(new Uint8Array(b)).map(x=>x.toString(16).padStart(2,'0')).join('')}
+ let h=5381;for(const c of salt+'|'+p)h=(h*33^c.charCodeAt(0))>>>0;return 'f'+h}
+const rnd=n=>Array.from(crypto.getRandomValues(new Uint8Array(n))).map(x=>'abcdefghjkmnpqrstuvwxyz23456789'[x%31]).join('');
+const hist=m=>{if(!AUTH)return;AUTH.hist=AUTH.hist||[];AUTH.hist.unshift({t:new Date().toISOString(),m:m});AUTH.hist.length=Math.min(AUTH.hist.length,60);saveA()};
+const THEMES=[['stripe','Stripe','Indigo accents, calm and precise','#635BFF','#F6F9FC'],['linear','Linear','Dark, fast and focused','#5E6AD2','#0B0C0E'],['notion','Notion','Warm paper, quiet chrome','#2383E2','#FBFBFA'],['apple','Apple','Soft, rounded and frosted','#0071E3','#F5F5F7'],['vercel','Vercel','Black and white, sharp edges','#0070F3','#FAFAFA']];
+function applyTheme(){document.documentElement.dataset.theme=(AUTH&&AUTH.theme)||'stripe'}
+function setTheme(t){AUTH.theme=t;saveA();applyTheme();toast('Theme: '+t);render()}
+function gate(mode){
+ $('#app').style.display='none';$('#modalRoot').innerHTML='';const g=$('#gate');g.style.display='flex';let b;
+ if(!AUTH||mode==='setup')b='<h2>Create the admin password</h2><p>This password protects all customer and billing data.</p><form onsubmit="doSetup(this);return false"><label>Your name<input name="n" required></label><label>Email (used to recover the password)<input name="e" type="email" required></label><label>Password (8+ characters)<input name="p" type="password" minlength="8" required></label><label>Repeat password<input name="p2" type="password" required></label><button class="btn">Create admin account</button></form>';
+ else if(mode==='rec')b='<h2>Recover password by email</h2><p>Enter your username or email and we will send you a 6-digit code.</p><form onsubmit="sendCode(this);return false"><label>Username or email<input name="u" required></label><div id="gerr" class="gerr"></div><button class="btn">Send code</button></form><a href="#" onclick="gate();return false">Back to sign in</a>';
+ else if(mode&&mode.verify)b='<h2>Enter the code</h2><p>We sent a code to <b>'+esc(mode.verify)+'</b>. It works for 10 minutes.</p><form onsubmit="verifyCode(this);return false"><label>6-digit code<input name="c" inputmode="numeric" required></label><label>New password (8+ characters)<input name="p" type="password" minlength="8" required></label><div id="gerr" class="gerr"></div><button class="btn">Reset password</button></form><a href="#" onclick="gate(\'rec\');return false">Send a new code</a>';
+ else b='<h2>Sign in</h2><form onsubmit="doLogin(this);return false"><label>Username<input name="u" autocomplete="username" required></label><label>Password<input name="p" type="password" autocomplete="current-password" required></label><div id="gerr" class="gerr"></div><button class="btn">Sign in</button></form><a href="#" onclick="gate(\'rec\');return false">Forgot password?</a>';
+ g.innerHTML='<div class="gc"><div class="gl">'+esc(DB.settings.name)+'</div>'+b+'<div class="hint" style="margin-top:10px;text-align:center">Version '+APPV+'</div></div>';
+}
+async function doSetup(f){
+ const E=f.elements,p=E['p'].value;if(p!==E['p2'].value){toast('Passwords do not match');return}
+ const s=rnd(8);AUTH={users:[{u:'admin',name:E['n'].value.trim(),email:E['e'].value.trim().toLowerCase(),role:'admin',on:1,s:s,h:await H(p,s)}],lock:15,theme:'stripe',hist:[]};saveA();enter(AUTH.users[0]);
+}
+let fails=0,until=0;
+async function doLogin(f){
+ const e=$('#gerr');if(Date.now()<until){e.textContent='Too many attempts. Wait '+Math.ceil((until-Date.now())/1000)+' seconds.';return}
+ const un=f.elements['u'].value.trim().toLowerCase(),u=AUTH.users.find(x=>x.u===un);
+ if(u&&u.on&&await H(f.elements['p'].value,u.s)===u.h){fails=0;enter(u);return}
+ if(++fails>=5){until=Date.now()+30000;fails=0}
+ hist('Failed sign-in for "'+un+'"');e.textContent=u&&!u.on?'This account is disabled. Ask the admin.':'Wrong username or password.';
+}
+const mask=e=>e.replace(/^(.).*(@.*)$/,'$1***$2');
+async function mailer(to,params){const m=AUTH.mail,r=await fetch('https://api.emailjs.com/api/v1.0/email/send',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({service_id:m.sid,template_id:m.tid,user_id:m.key,template_params:Object.assign({to_email:to,app_name:DB.settings.name},params)})});if(!r.ok)throw new Error((await r.text())||r.status)}
+async function sendCode(f){
+ const e=$('#gerr'),q=f.elements['u'].value.trim().toLowerCase(),u=AUTH.users.find(x=>x.u===q||(x.email&&x.email===q));
+ if(!AUTH.mail||!AUTH.mail.sid){e.textContent='Email recovery is not set up yet. Ask the admin.';return}
+ if(!u||!u.on||!u.email){e.textContent='No active account with an email matches that.';return}
+ if(AUTH.rc&&Date.now()-AUTH.rc.at<6e4){e.textContent='Wait a minute before asking for another code.';return}
+ const code=String(crypto.getRandomValues(new Uint32Array(1))[0]%1e6).padStart(6,'0'),sl=rnd(8);
+ AUTH.rc={u:u.u,s:sl,h:await H(code,sl),exp:Date.now()+6e5,at:Date.now(),tries:0};saveA();e.textContent='Sending...';
+ try{await mailer(u.email,{to_name:u.name,code:code});hist('Recovery code emailed for "'+u.u+'"');gate({verify:mask(u.email)})}
+ catch(x){e.textContent='Could not send the email: '+x.message}
+}
+async function verifyCode(f){
+ const e=$('#gerr'),r=AUTH.rc;if(!r||Date.now()>r.exp||r.tries>=5){e.textContent='That code has expired. Ask for a new one.';return}
+ r.tries++;saveA();if(await H(f.elements['c'].value.trim(),r.s)!==r.h){e.textContent='Wrong code.';return}
+ const u=AUTH.users.find(x=>x.u===r.u);u.s=rnd(8);u.h=await H(f.elements['p'].value,u.s);AUTH.rc=null;hist('Password reset by email for "'+u.u+'"');saveA();enter(u);
+}
+function enter(u,quiet){
+ ME=u;sessionStorage.setItem('sl_u',u.u);$('#gate').style.display='none';$('#gate').innerHTML='';$('#app').style.display='flex';
+ if(!quiet)hist('Signed in: '+u.u);view={name:'dashboard',cid:null};render();idle();
+}
+function logout(){sessionStorage.removeItem('sl_u');ME=null;clearTimeout(idleT);gate()}
+let idleT;function idle(){clearTimeout(idleT);if(ME&&AUTH.lock>0)idleT=setTimeout(logout,AUTH.lock*6e4)}
+['click','keydown','mousemove','touchstart'].forEach(e=>addEventListener(e,idle,{passive:true}));
+function viewAdmin(){
+ const tiles=THEMES.map(t=>'<div class="tile'+((AUTH.theme||'stripe')===t[0]?' sel':'')+'" onclick="setTheme(\''+t[0]+'\')"><div class="sw" style="background:'+t[4]+'"><i style="background:'+t[3]+'"></i></div><b>'+t[1]+'</b><small>'+t[2]+'</small></div>').join('');
+ const rows=AUTH.users.map((u,i)=>'<tr><td>'+esc(u.name)+'</td><td>'+esc(u.u)+'<br><small class="hint">'+esc(u.email||'no email yet')+'</small></td><td class="c">'+u.role+'</td><td class="c">'+(u.on?'<span class="pill cash">Active</span>':'<span class="pill on">Disabled</span>')+'</td><td style="white-space:normal;min-width:330px">'+(u.role==='admin'?'<span class="ok">Full access, plus Admin Panel</span>':[['dashboard','Dashboard',0],['customers','Customers',1],['rates','Rates',1],['quotes','Quotations',1],['stock','Stock',1],['billing','Billing',0],['settings','Settings & Backup',1]].map(k=>'<div style="display:flex;gap:12px;align-items:center;margin:2px 0"><span style="width:125px">'+k[1]+'</span><label style="display:inline-flex;align-items:center;margin:0;font-weight:normal"><input type="checkbox" style="width:auto;margin:0 4px 0 0"'+((u.perm||DEF).includes(k[0])?' checked':'')+' onchange="setPerm('+i+',\''+k[0]+'\',\'see\',this.checked)">See</label>'+(k[2]?'<label style="display:inline-flex;align-items:center;margin:0;font-weight:normal"><input type="checkbox" style="width:auto;margin:0 4px 0 0"'+((u.edit||DEFE).includes(k[0])?' checked':'')+' onchange="setPerm('+i+',\''+k[0]+'\',\'edit\',this.checked)">Edit</label>':'<span class="hint">view only</span>')+'</div>').join(''))+'</td><td class="c"><button class="btn sm ghost" onclick="setEmail('+i+')">Set email</button> <button class="btn sm ghost" onclick="resetPw('+i+')"'+(i||isOwner()?'':' disabled')+'>Set password</button>'+(i?' <button class="btn sm ghost" onclick="toggleU('+i+')">'+(u.on?'Disable':'Enable')+'</button> <button class="btn sm danger" onclick="delU('+i+')">Delete</button>':'')+'</td></tr>').join('');
+ const lb=DB.meta.lastBackup;
+ return head('Admin Panel','ایڈمن پینل','Control who can sign in, how the app looks, and your data')+
+ '<div class="grid kpis"><div class="kpi"><div class="l">Customers</div><div class="v">'+DB.customers.length+'</div></div><div class="kpi gold"><div class="l">Ledger entries</div><div class="v">'+DB.entries.length+'</div></div><div class="kpi green"><div class="l">Active users</div><div class="v">'+AUTH.users.filter(u=>u.on).length+'</div></div><div class="kpi '+(lb?'':'red')+'"><div class="l">Last backup</div><div class="v" style="font-size:16px">'+(lb?fd8(lb.slice(0,10)):'Never')+'</div></div></div>'+
+ '<div class="card"><h2>Interface style</h2><div class="tiles">'+tiles+'</div></div>'+
+ '<div class="card"><h2>Users and access</h2><div class="tw"><table><thead><tr><th>Name</th><th>Username</th><th>Role</th><th>Status</th><th>Access: what they can see and edit</th><th>Actions</th></tr></thead><tbody>'+rows+'</tbody></table></div><p class="hint">Admins control everything. For each staff member, tick <b>See</b> to let them open a section and <b>Edit</b> to let them change things in it (add, edit, delete). See without Edit means view only. The Admin Panel is always admin-only, and the main admin account cannot be disabled or deleted.</p>'+
+ '<form onsubmit="addUser(this);return false" class="f4" style="margin-top:10px;grid-template-columns:repeat(auto-fit,minmax(140px,1fr))"><input name="n" placeholder="Full name" required><input name="u" placeholder="Username" required><input name="e" type="email" placeholder="Email" required><input name="p" type="password" placeholder="Password (8+)" minlength="8" required><select name="r"><option value="staff">Staff</option><option value="admin">Admin</option></select><button class="btn">Add user</button></form></div>'+
+ '<div class="card"><h2>Security</h2><div class="bar"><label style="margin:0">Lock the app after inactivity<select onchange="setLock(this.value)">'+[[0,'Never'],[5,'5 minutes'],[15,'15 minutes'],[30,'30 minutes'],[60,'1 hour']].map(o=>'<option value="'+o[0]+'"'+(AUTH.lock==o[0]?' selected':'')+'>'+o[1]+'</option>').join('')+'</select></label><span class="sp"></span><button class="btn ghost" onclick="logout()">Lock now</button></div></div>'+
+ '<div class="card"><h2>Email password recovery</h2><p class="hint" style="margin-top:0">'+(AUTH.mail&&AUTH.mail.sid?'<span class="ok">Set up.</span> ':'<b>Not set up yet.</b> ')+'Uses the free EmailJS service (emailjs.com). Connect your email there, create a template that sends to {{to_email}} and shows {{code}}, then paste its three IDs here.</p><form onsubmit="saveMail(this);return false" class="f4" style="grid-template-columns:repeat(auto-fit,minmax(150px,1fr))"><input name="s" placeholder="Service ID" value="'+esc((AUTH.mail||{}).sid)+'"><input name="t" placeholder="Template ID" value="'+esc((AUTH.mail||{}).tid)+'"><input name="k" placeholder="Public key" value="'+esc((AUTH.mail||{}).key)+'"><button class="btn">Save</button><button type="button" class="btn ghost" onclick="testMail()">Send test to me</button></form></div>'+
+ '<div class="card"><h2>Data</h2><div class="bar"><button class="btn" onclick="nav(\'settings\')">Business details and backup</button><button class="btn ghost" onclick="backup()">Download backup</button><button class="btn ghost" onclick="exportAllCsv()">Export all entries</button></div></div>'+
+ '<p class="hint" style="text-align:center">Steel Ledger Pro version '+APPV+'</p><div class="card"><h2>Sign-in history</h2><div class="tw" style="max-height:260px;overflow:auto"><table><thead><tr><th>When</th><th>Event</th></tr></thead><tbody>'+((AUTH.hist||[]).map(h=>'<tr><td>'+esc(new Date(h.t).toLocaleString())+'</td><td>'+esc(h.m)+'</td></tr>').join('')||'<tr><td colspan="2" class="c">No events yet</td></tr>')+'</tbody></table></div></div>';
+}
+async function addUser(f){
+ const u=f.elements['u'].value.trim().toLowerCase();if(AUTH.users.some(x=>x.u===u)){toast('That username is taken');return}
+ const s=rnd(8);AUTH.users.push({u:u,name:f.elements['n'].value.trim(),email:f.elements['e'].value.trim().toLowerCase(),role:f.elements['r'].value,perm:DEF.slice(),on:1,s:s,h:await H(f.elements['p'].value,s)});hist('Admin added user "'+u+'"');saveA();render();toast('User added');
+}
+async function resetPw(i){if(!i&&!isOwner()){toast('Only the main admin can change this password');return}const p=prompt('New password for '+AUTH.users[i].name+' (8+ characters):');if(!p)return;if(p.length<8){toast('Use at least 8 characters');return}
+ const u=AUTH.users[i];u.s=rnd(8);u.h=await H(p,u.s);hist('Password changed for "'+u.u+'"');saveA();toast('Password updated')}
+function setPerm(i,k,kind,on){
+ const u=AUTH.users[i],P=(u.perm||DEF).slice(),E=(u.edit||DEFE).slice(),add=(a,x)=>{if(a.indexOf(x)<0)a.push(x)},del=(a,x)=>{const j=a.indexOf(x);if(j>=0)a.splice(j,1)};
+ if(kind==='see'){on?add(P,k):(del(P,k),del(E,k))}else{on?(add(E,k),add(P,k)):del(E,k)}
+ u.perm=P;u.edit=E;hist('Access for "'+u.u+'": '+k+' '+kind+' '+(on?'on':'off'));saveA();render();toast('Access updated');
+}
+function toggleU(i){const u=AUTH.users[i];u.on=u.on?0:1;hist((u.on?'Enabled ':'Disabled ')+'user "'+u.u+'"');saveA();render()}
+function delU(i){const u=AUTH.users[i];if(!confirm('Delete user '+u.name+'?'))return;AUTH.users.splice(i,1);hist('Deleted user "'+u.u+'"');saveA();render()}
+function setLock(v){AUTH.lock=+v;saveA();idle();toast('Auto-lock updated')}
+function saveMail(f){const E=f.elements;AUTH.mail={sid:E['s'].value.trim(),tid:E['t'].value.trim(),key:E['k'].value.trim()};saveA();render();toast('Email settings saved')}
+async function testMail(){if(!ME.email){toast('Add your email first (Set email)');return}if(!AUTH.mail||!AUTH.mail.sid){toast('Save the email settings first');return}try{await mailer(ME.email,{to_name:ME.name,code:'123456'});toast('Test email sent to '+ME.email)}catch(x){toast('Failed: '+x.message)}}
+function setEmail(i){if(!i&&!isOwner()){toast('Only the main admin can change this email');return}const u=AUTH.users[i],v=prompt('Email for '+u.name+':',u.email||'');if(v==null)return;if(!/^\S+@\S+\.\S+$/.test(v.trim())){toast('That is not a valid email');return}u.email=v.trim().toLowerCase();hist('Email set for "'+u.u+'"');saveA();render();toast('Email saved')}
+const GUARD={customers:['modalCustomer','delCustomer','modalSupply','modalPayment','delEntry'],quotes:['modalQuote','delQuote','convertQuote'],stock:['modalPurchase','delPurchase','setMin'],rates:['addGrade','delGrade','addRate','delRate'],settings:['saveSettings','restore','resetAll']};
+const secOf=()=>view.name==='customer'?'customers':view.name;
+for(const k in GUARD)GUARD[k].forEach(n=>{const o=window[n];if(typeof o!=='function')return;window[n]=function(){if(!canEdit(k)){toast('You have view-only access to this section');return}return o.apply(this,arguments)}});
+{const _r=render;render=function(){_r();const k=secOf();if(!ME||canEdit(k)||!GUARD[k])return;
+ const m=$('#main');GUARD[k].forEach(n=>m.querySelectorAll('[onclick*="'+n+'("],[onchange*="'+n+'("],[onsubmit*="'+n+'("]').forEach(el=>{el.style.display='none'}));
+ if(k==='settings')m.querySelectorAll('input,select,textarea').forEach(el=>el.disabled=true);
+ m.insertAdjacentHTML('afterbegin','<div class="banner y" style="margin-bottom:10px">View only. Ask the admin if you need to make changes here.</div>')}}
+const APPV='2.3';
+function syncAuth(raw){
+ try{AUTH=JSON.parse(raw!==undefined?raw:localStorage.getItem(AK))}catch(x){return}
+ if(!AUTH){ME=null;gate();return}
+ applyTheme();if(!ME)return;
+ const u=AUTH.users.find(x=>x.u===ME.u);if(!u||!u.on){logout();return}
+ ME=u;render();
+}
+addEventListener('storage',e=>{
+ if(e.key===AK)syncAuth(e.newValue);
+ else if(e.key===KEY&&ME){DB=load();render()}
+});
+addEventListener('focus',()=>{if(ME){syncAuth();try{DB=load()}catch(x){}render()}});
+applyTheme();
+{const su=sessionStorage.getItem('sl_u'),u=AUTH&&AUTH.users.find(x=>x.u===su&&x.on);if(u)enter(u,true);else gate()}
+</script>
+</body>
+</html>
